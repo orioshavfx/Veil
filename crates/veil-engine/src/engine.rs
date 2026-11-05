@@ -1,0 +1,220 @@
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use anyhow::{Context, Result};
+use std::time::Duration;
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional};
+use tokio::net::TcpListener;
+use tokio::task::{JoinHandle, JoinSet};
+use veil_config::{RouteAction, RoutingConfig, ServerConfig};
+use veil_proto::{Address, ProxyOutbound};
+
+use crate::inbound::mixed;
+use crate::router::Router;
+use crate::rules::Rules;
+use crate::tun::{Tun, TunOptions};
+
+const FIRST_DATA_WAIT: Duration = Duration::from_millis(50);
+const IMPLICIT_DIRECT_TIMEOUT: Duration = Duration::from_secs(4);
+
+pub struct EngineConfig {
+    pub listen: SocketAddr,
+    pub server: ServerConfig,
+    pub routing: RoutingConfig,
+    /// Directory holding geoip.dat / geosite.dat.
+    pub geo_dir: PathBuf,
+    /// Capture all system traffic (needs root).
+    pub tun: Option<TunOptions>,
+}
+
+#[derive(Debug, Default)]
+pub struct Stats {
+    pub upload: AtomicU64,
+    pub download: AtomicU64,
+    pub active: AtomicU64,
+}
+
+pub(crate) struct Shared {
+    pub router: Router,
+    pub stats: Arc<Stats>,
+}
+
+impl Shared {
+    /// Connects to `dst` via the routed outbound and relays until either side closes.
+    /// `src` is the client's local endpoint, for per-app routing.
+    pub async fn relay<S>(
+        &self,
+        mut inbound: S,
+        dst: Address,
+        first: &[u8],
+        src: Option<SocketAddr>,
+    ) -> std::io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let decision = self.router.decide(&dst, src.map(|a| (crate::process::Proto::Tcp, a))).await;
+        let outbound = self.router.outbound(decision.action);
+        tracing::debug!("{dst} -> {}", outbound.name());
+        let mut remote = if decision.action == RouteAction::Direct && !decision.explicit {
+            // Nothing asked for "direct" explicitly: if the site does not open
+            // directly (blocked DNS, reset, no route), it is probably censored.
+            match tokio::time::timeout(IMPLICIT_DIRECT_TIMEOUT, outbound.connect_tcp(&dst)).await {
+                Ok(Ok(r)) => r,
+                failed => {
+                    let why = match failed {
+                        Ok(Err(e)) => e.to_string(),
+                        _ => "timed out".to_string(),
+                    };
+                    tracing::info!("{dst}: direct failed ({why}), retrying via VPN");
+                    let proxy = self.router.outbound(RouteAction::Proxy);
+                    proxy.connect_tcp(&dst).await.inspect_err(|e| tracing::warn!("{dst} via proxy: {e}"))?
+                }
+            }
+        } else {
+            outbound.connect_tcp(&dst).await.inspect_err(|e| {
+                tracing::warn!("{dst} via {}: {e}", outbound.name());
+            })?
+        };
+        if !first.is_empty() {
+            remote.write_all(first).await?;
+        } else {
+            // Protocol headers ride along with the client's first bytes. If the client
+            // is silent (server-speaks-first protocols), send the header on its own.
+            let mut buf = vec![0u8; 16 * 1024];
+            match tokio::time::timeout(FIRST_DATA_WAIT, inbound.read(&mut buf)).await {
+                Ok(Ok(0)) | Err(_) => {}
+                Ok(Ok(n)) => {
+                    remote.write_all(&buf[..n]).await?;
+                    self.stats.upload.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                Ok(Err(e)) => return Err(e),
+            }
+        }
+        remote.flush().await?;
+        self.stats.active.fetch_add(1, Ordering::Relaxed);
+        let result = copy_bidirectional(&mut inbound, &mut remote).await;
+        self.stats.active.fetch_sub(1, Ordering::Relaxed);
+        let (up, down) = result?;
+        self.stats.upload.fetch_add(up + first.len() as u64, Ordering::Relaxed);
+        self.stats.download.fetch_add(down, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// A running proxy. Dropping it (or calling [`Engine::stop`]) closes all connections.
+pub struct Engine {
+    task: JoinHandle<()>,
+    shared: Arc<Shared>,
+    tun: Option<Tun>,
+    stats: Arc<Stats>,
+    local_addr: SocketAddr,
+    warm_up: std::sync::Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Engine {
+    pub async fn start(config: EngineConfig) -> Result<Self> {
+        let outbound: Arc<dyn veil_proto::Outbound> =
+            Arc::new(ProxyOutbound::new(config.server.clone()).context("invalid server config")?);
+        let rules = Rules::compile(&config.routing, &config.geo_dir).context("invalid routing rules")?;
+        let listener = TcpListener::bind(config.listen)
+            .await
+            .with_context(|| format!("cannot listen on {}", config.listen))?;
+        let local_addr = listener.local_addr()?;
+        let stats = Arc::new(Stats::default());
+        let shared = Arc::new(Shared { router: Router::new(rules, outbound.clone()), stats: stats.clone() });
+        tracing::info!("mixed inbound listening on {local_addr}");
+
+        let shared_for_tun = shared.clone();
+        let shared_for_engine = shared.clone();
+        let task = tokio::spawn(async move {
+            let mut conns = JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => match accepted {
+                        Ok((stream, peer)) => {
+                            let _ = stream.set_nodelay(true);
+                            let shared = shared.clone();
+                            conns.spawn(async move {
+                                if let Err(e) = mixed::handle(stream, &shared).await {
+                                    tracing::debug!("{peer}: {e}");
+                                }
+                            });
+                        }
+                        Err(e) => tracing::warn!("accept: {e}"),
+                    },
+                    Some(_) = conns.join_next(), if !conns.is_empty() => {}
+                }
+            }
+        });
+        let tun = match config.tun {
+            Some(opts) => match Tun::start(shared_for_tun, opts, &config.server).await {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    task.abort();
+                    return Err(e);
+                }
+            },
+            None => None,
+        };
+        // Warm-up starts only after the TUN bypass is installed.
+        let warm_up = tokio::spawn(async move { outbound.warm_up().await });
+        Ok(Self { task, shared: shared_for_engine, tun, stats, local_addr, warm_up: std::sync::Mutex::new(Some(warm_up)) })
+    }
+
+    /// Switches to another server without dropping the listener or TUN.
+    pub async fn set_server(&self, server: ServerConfig) -> Result<()> {
+        let outbound: Arc<dyn veil_proto::Outbound> =
+            Arc::new(ProxyOutbound::new(server.clone()).context("invalid server config")?);
+        if let Some(tun) = &self.tun {
+            tun.server_changed(&server).await;
+        }
+        self.shared.router.set_proxy(outbound.clone());
+        let handle = tokio::spawn(async move { outbound.warm_up().await });
+        if let Some(old) = self.warm_up.lock().unwrap_or_else(|e| e.into_inner()).replace(handle) {
+            old.abort();
+        }
+        tracing::info!("server switched to {}:{}", server.address, server.port);
+        Ok(())
+    }
+
+    pub fn set_routing(&self, routing: &RoutingConfig, geo_dir: &std::path::Path) -> Result<()> {
+        let rules = Rules::compile(routing, geo_dir).context("invalid routing rules")?;
+        self.shared.router.set_rules(rules);
+        Ok(())
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub fn stats(&self) -> &Arc<Stats> {
+        &self.stats
+    }
+
+    pub async fn stop(mut self) {
+        if let Some(tun) = self.tun.take() {
+            tun.stop().await;
+        }
+        self.abort_warm_up();
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
+}
+
+impl Engine {
+    fn abort_warm_up(&self) {
+        if let Some(h) = self.warm_up.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            h.abort();
+        }
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.abort_warm_up();
+        self.task.abort();
+    }
+}

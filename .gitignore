@@ -1,0 +1,20 @@
+target/
+dist/
+app/src-tauri/binaries/
+app/src-tauri/gen/
+
+# macOS
+.DS_Store
+
+# Geo lists: downloaded by app/fetch-geo.sh (about 10 MB, updated daily upstream)
+app/src-tauri/resources/geoip.dat
+app/src-tauri/resources/geosite.dat
+
+# Local build-check helpers (not part of the project)
+veil-check.sh
+veil-check.log
+veil-check.log.tmp
+veil-watch.sh
+
+# Registry marker inside the vendored crate
+vendor/ipstack/.cargo-ok

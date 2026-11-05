@@ -1,0 +1,38 @@
+[package]
+name = "veil-engine"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+veil-config.workspace = true
+veil-proto.workspace = true
+veil-sysproxy = { path = "../veil-sysproxy" }
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+regex = "1"
+tun-rs = { version = "2.8.18", features = ["async_tokio"] }
+ipstack = "1.0.1"
+socket2 = "0.6.5"
+libc = "0.2.191"
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+sha2.workspace = true
+uuid.workspace = true
+shadowsocks = { version = "1.25", default-features = false, features = ["aead-cipher", "aead-cipher-2022"] }
+serde_json.workspace = true
+base64.workspace = true
+percent-encoding.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }

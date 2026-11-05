@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Veil</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand"><span class="logo">V</span><span id="top-title">Veil</span></div>
+    <button class="icon-top" id="open-settings" title="Settings" aria-label="Settings">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 2.8v2.4M12 18.8v2.4M2.8 12h2.4M18.8 12h2.4M5.5 5.5l1.7 1.7M16.8 16.8l1.7 1.7M5.5 18.5l1.7-1.7M16.8 7.2l1.7-1.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+    </button>
+    <button class="back" id="close-settings" hidden>← Back</button>
+  </header>
+
+  <main id="view-main">
+    <section class="hero" id="hero">
+      <button class="power" id="power" aria-label="Connect">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v8M6.3 6.8a8 8 0 1 0 11.4 0" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
+      </button>
+      <div class="status" id="status">Disconnected</div>
+      <div class="server-name" id="current">No server selected</div>
+      <button class="caption" id="caption" title="Change in settings"></button>
+      <div class="meters">
+        <div><span class="arrow">↑</span><span id="up">0 B/s</span></div>
+        <div id="timer">00:00:00</div>
+        <div><span class="arrow">↓</span><span id="down">0 B/s</span></div>
+      </div>
+    </section>
+
+    <form class="add" id="add">
+      <input id="link" placeholder="vless:// … link or subscription URL" autocomplete="off" spellcheck="false">
+      <button type="submit">Add</button>
+    </form>
+
+    <div class="list-head">
+      <h2>Servers</h2>
+      <div class="tools">
+        <button id="ping" title="Measure latency">Ping</button>
+        <button id="refresh" title="Update subscriptions">Update</button>
+      </div>
+    </div>
+    <div id="groups"></div>
+    <p class="empty" id="empty" hidden>Add a server link or a subscription using the field above.</p>
+  </main>
+
+  <main id="view-settings" hidden>
+    <section class="card">
+      <h3>Connection mode</h3>
+      <div class="seg wide" id="mode" role="radiogroup" aria-label="Connection mode">
+        <button data-mode="proxy" role="radio">Proxy</button>
+        <button data-mode="tun" role="radio">TUN</button>
+      </div>
+      <p class="desc" id="mode-desc"></p>
+    </section>
+
+    <section class="card">
+      <h3>Routing</h3>
+      <div class="seg wide" id="routing" role="radiogroup" aria-label="Routing"></div>
+      <p class="desc" id="routing-desc"></p>
+    </section>
+
+    <section class="card">
+      <h3>Rules for sites and apps</h3>
+      <form class="rule-form" id="rule-form">
+        <div class="seg" id="rule-kind" role="radiogroup" aria-label="Rule type">
+          <button type="button" data-kind="site" role="radio" aria-checked="true">Sites</button>
+          <button type="button" data-kind="app" role="radio" aria-checked="false">Apps</button>
+        </div>
+        <input id="rule-input" autocomplete="off" spellcheck="false">
+        <div class="app-list" id="app-list" role="listbox" aria-multiselectable="true" hidden></div>
+        <div class="rule-actions">
+          <select id="rule-action" aria-label="Action">
+            <option value="proxy">Via VPN</option>
+            <option value="direct">Direct</option>
+            <option value="block">Block</option>
+          </select>
+          <button type="submit">Add rule</button>
+        </div>
+      </form>
+      <p class="hint" id="rule-hint"></p>
+      <div id="rules"></div>
+      <p class="empty small" id="rules-empty" hidden></p>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" hidden></div>
+  <script src="main.js"></script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+[package]
+name = "veil-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "veil"
+path = "src/main.rs"
+
+[dependencies]
+veil-config.workspace = true
+veil-engine.workspace = true
+veil-sysproxy = { path = "../veil-sysproxy" }
+veil-helper.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
