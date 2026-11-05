@@ -148,6 +148,7 @@ fn outbound(o: &Value) -> Result<ServerConfig, String> {
                     alpn: vec!["h3".into()],
                     fingerprint: None,
                     insecure: t.get("allowInsecure").and_then(Value::as_bool).unwrap_or(false),
+                    pin_sha256: Vec::new(),
                 }),
             });
         }
@@ -194,6 +195,7 @@ fn outbound(o: &Value) -> Result<ServerConfig, String> {
                     .unwrap_or_default(),
                 fingerprint: str_at(&t, &["fingerprint"]).map(str::to_string),
                 insecure: t.get("allowInsecure").and_then(Value::as_bool).unwrap_or(false),
+                pin_sha256: Vec::new(),
             })
         }
         "reality" => {

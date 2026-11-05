@@ -76,28 +76,134 @@ fn check_geo_dir(dir: &Path, uid: u32) -> Result<PathBuf> {
     Ok(canon)
 }
 
-fn dns_backup_path() -> Result<PathBuf> {
+/// Create (if needed) and verify a root-only directory: a real directory (never a
+/// symlink), owned by `owner`, mode 0700.
+fn ensure_private_dir(dir: &Path, owner: u32) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-    if let Some(parent) = Path::new(DNS_BACKUP_DIR).parent() {
+    if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    match std::fs::DirBuilder::new().mode(0o700).create(DNS_BACKUP_DIR) {
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e.into()),
     }
     // Never follow a symlink planted at the path: inspect the entry itself.
-    let meta = std::fs::symlink_metadata(DNS_BACKUP_DIR)?;
+    let meta = std::fs::symlink_metadata(dir)?;
     if !meta.file_type().is_dir() {
-        bail!("{DNS_BACKUP_DIR} is not a regular directory");
+        bail!("{} is not a regular directory", dir.display());
     }
-    if meta.uid() != 0 {
-        bail!("{DNS_BACKUP_DIR} is not owned by root");
+    if meta.uid() != owner {
+        bail!("{} has unexpected owner {}", dir.display(), meta.uid());
     }
     if meta.mode() & 0o7777 != 0o700 {
-        std::fs::set_permissions(DNS_BACKUP_DIR, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
+    Ok(())
+}
+
+fn dns_backup_path() -> Result<PathBuf> {
+    ensure_private_dir(Path::new(DNS_BACKUP_DIR), 0)?;
     Ok(Path::new(DNS_BACKUP_DIR).join(DNS_BACKUP_FILE))
+}
+
+/// Root-only copy of the client's geo files; the engine reads only from here.
+fn geo_stage_dir() -> Result<PathBuf> {
+    ensure_private_dir(Path::new(DNS_BACKUP_DIR), 0)?;
+    let dir = Path::new(DNS_BACKUP_DIR).join(GEO_STAGE_SUBDIR);
+    ensure_private_dir(&dir, 0)?;
+    Ok(dir)
+}
+
+const GEO_STAGE_SUBDIR: &str = "geo";
+const GEO_FILES: [&str; 2] = ["geoip.dat", "geosite.dat"];
+const GEO_MAX_SIZE: u64 = 64 << 20;
+
+/// Copy one geo file from the client's directory into `dst_dir` without trusting the
+/// source path: open with O_NOFOLLOW (+O_NONBLOCK so a FIFO cannot hang root), check the
+/// opened fd (regular file, owned by the client, size limit) and read through that same
+/// fd. The data goes to an O_EXCL temp file that is fsynced and renamed over the old one.
+/// A missing source removes any previously staged copy.
+fn copy_geo_file(src_dir: &Path, dst_dir: &Path, name: &str, client_uid: u32, max_size: u64) -> Result<()> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    let src = src_dir.join(name);
+    let dst = dst_dir.join(name);
+    let input = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(&src)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::remove_file(&dst) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("cannot remove stale {}", dst.display())),
+            }
+            return Ok(());
+        }
+        Err(e) => return Err(e).with_context(|| format!("cannot open {}", src.display())),
+    };
+    let meta = input.metadata()?; // fstat on the opened descriptor
+    if !meta.file_type().is_file() {
+        bail!("{} is not a regular file", src.display());
+    }
+    if meta.uid() != client_uid {
+        bail!("{} is not owned by the client", src.display());
+    }
+    if meta.len() > max_size {
+        bail!("{} is too large ({} bytes, limit {max_size})", src.display(), meta.len());
+    }
+
+    let tmp = dst_dir.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&tmp)
+        .with_context(|| format!("cannot create {}", tmp.display()))?;
+    let written = (|| -> Result<()> {
+        // The file may grow after fstat: bound the actual read as well.
+        let n = std::io::copy(&mut (&input).take(max_size + 1), &mut out)?;
+        if n > max_size {
+            bail!("{} grew beyond the {max_size} byte limit", src.display());
+        }
+        out.sync_all()?;
+        Ok(())
+    })();
+    drop(out);
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, &dst).map_err(Into::into)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn copy_geo_files(src_dir: &Path, dst_dir: &Path, client_uid: u32, max_size: u64) -> Result<()> {
+    for name in GEO_FILES {
+        copy_geo_file(src_dir, dst_dir, name, client_uid, max_size)?;
+    }
+    Ok(())
+}
+
+/// Validate the client's geo dir and return the root-owned copy the engine may read.
+async fn stage_geo(geo_dir: PathBuf, uid: u32) -> Result<PathBuf> {
+    tokio::task::spawn_blocking(move || {
+        let src = check_geo_dir(&geo_dir, uid)?;
+        let dst = geo_stage_dir()?;
+        copy_geo_files(&src, &dst, uid, GEO_MAX_SIZE)?;
+        Ok(dst)
+    })
+    .await
+    .context("geo copy task failed")?
 }
 
 async fn handle(req: Request, shared: &Shared, uid: u32, client_pid: u32) -> Response {
@@ -116,7 +222,7 @@ async fn handle(req: Request, shared: &Shared, uid: u32, client_pid: u32) -> Res
             })
         }
         Request::Update { server, routing, geo_dir } => {
-            let geo_dir = match check_geo_dir(&geo_dir, uid) {
+            let geo_dir = match stage_geo(geo_dir, uid).await {
                 Ok(d) => d,
                 Err(e) => return Response::Error { message: format!("{e:#}") },
             };
@@ -141,7 +247,7 @@ async fn handle(req: Request, shared: &Shared, uid: u32, client_pid: u32) -> Res
             Response::Ok
         }
         Request::Start { server, routing, geo_dir, mixed_port, routes } => {
-            let geo_dir = match check_geo_dir(&geo_dir, uid) {
+            let geo_dir = match stage_geo(geo_dir, uid).await {
                 Ok(d) => d,
                 Err(e) => return Response::Error { message: format!("{e:#}") },
             };
@@ -363,5 +469,95 @@ mod tests {
     fn geo_dir_uid_zero_skips_restrictions() {
         let got = check_geo_dir(Path::new("/tmp"), 0).expect("uid 0 is unrestricted");
         assert_eq!(got, Path::new("/tmp").canonicalize().unwrap());
+    }
+
+    /// Unique scratch directory under the system temp dir, removed on drop.
+    fn scratch(tag: &str) -> TmpDir {
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("veil-copy-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        TmpDir(p)
+    }
+
+    fn src_dst(tag: &str) -> (TmpDir, TmpDir) {
+        (scratch(&format!("{tag}-src")), scratch(&format!("{tag}-dst")))
+    }
+
+    #[test]
+    fn copy_regular_file() {
+        let (src, dst) = src_dst("ok");
+        std::fs::write(src.0.join("geoip.dat"), b"ip-data").unwrap();
+        std::fs::write(src.0.join("geosite.dat"), b"site-data").unwrap();
+        copy_geo_files(&src.0, &dst.0, current_uid(), 1024).unwrap();
+        assert_eq!(std::fs::read(dst.0.join("geoip.dat")).unwrap(), b"ip-data");
+        assert_eq!(std::fs::read(dst.0.join("geosite.dat")).unwrap(), b"site-data");
+        // No temp files left behind.
+        assert_eq!(std::fs::read_dir(&dst.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn copy_missing_file_is_skipped_and_removes_stale_copy() {
+        let (src, dst) = src_dst("missing");
+        std::fs::write(dst.0.join("geoip.dat"), b"stale").unwrap();
+        copy_geo_files(&src.0, &dst.0, current_uid(), 1024).unwrap();
+        assert!(!dst.0.join("geoip.dat").exists());
+    }
+
+    #[test]
+    fn copy_rejects_symlink() {
+        let (src, dst) = src_dst("symlink");
+        let target = src.0.join("real");
+        std::fs::write(&target, b"secret").unwrap();
+        std::os::unix::fs::symlink(&target, src.0.join("geoip.dat")).unwrap();
+        assert!(copy_geo_files(&src.0, &dst.0, current_uid(), 1024).is_err());
+        assert!(!dst.0.join("geoip.dat").exists());
+    }
+
+    #[test]
+    fn copy_rejects_directory() {
+        let (src, dst) = src_dst("dir");
+        std::fs::create_dir(src.0.join("geoip.dat")).unwrap();
+        assert!(copy_geo_files(&src.0, &dst.0, current_uid(), 1024).is_err());
+    }
+
+    #[test]
+    fn copy_rejects_oversized_file() {
+        let (src, dst) = src_dst("big");
+        std::fs::write(src.0.join("geoip.dat"), vec![0u8; 11]).unwrap();
+        assert!(copy_geo_files(&src.0, &dst.0, current_uid(), 10).is_err());
+        assert!(!dst.0.join("geoip.dat").exists());
+        std::fs::write(src.0.join("geoip.dat"), vec![0u8; 10]).unwrap();
+        copy_geo_files(&src.0, &dst.0, current_uid(), 10).unwrap();
+    }
+
+    #[test]
+    fn copy_rejects_foreign_owner() {
+        let (src, dst) = src_dst("owner");
+        std::fs::write(src.0.join("geoip.dat"), b"x").unwrap();
+        assert!(copy_geo_files(&src.0, &dst.0, current_uid().wrapping_add(1), 1024).is_err());
+    }
+
+    #[test]
+    fn copy_overwrites_existing() {
+        let (src, dst) = src_dst("overwrite");
+        std::fs::write(dst.0.join("geoip.dat"), b"old-old-old").unwrap();
+        std::fs::write(src.0.join("geoip.dat"), b"new").unwrap();
+        copy_geo_files(&src.0, &dst.0, current_uid(), 1024).unwrap();
+        assert_eq!(std::fs::read(dst.0.join("geoip.dat")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn private_dir_is_created_0700_and_symlink_rejected() {
+        use std::os::unix::fs::MetadataExt;
+        let base = scratch("private");
+        let d = base.0.join("geo");
+        ensure_private_dir(&d, current_uid()).unwrap();
+        assert_eq!(std::fs::metadata(&d).unwrap().mode() & 0o7777, 0o700);
+        let link = base.0.join("link");
+        std::os::unix::fs::symlink(&d, &link).unwrap();
+        assert!(ensure_private_dir(&link, current_uid()).is_err());
+        assert!(ensure_private_dir(&d, current_uid().wrapping_add(1)).is_err());
     }
 }

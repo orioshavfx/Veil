@@ -123,6 +123,31 @@ pub struct TlsConfig {
     pub fingerprint: Option<String>,
     #[serde(default)]
     pub insecure: bool,
+    /// Hysteria 2 `pinSHA256`: lowercase hex SHA-256 digests (64 chars) of the server's leaf
+    /// certificate (DER). When non-empty the certificate is accepted only if it matches one
+    /// of them, and chain/name verification is replaced by this check.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pin_sha256: Vec<String>,
+}
+
+/// Parses one certificate pin: 64 hex digits, case-insensitive, optionally separated by `:` or `-`.
+pub fn parse_pin_sha256(s: &str) -> Option<[u8; 32]> {
+    let digits: Vec<u8> = s.trim().bytes().filter(|b| !matches!(b, b':' | b'-')).collect();
+    if digits.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, pair) in digits.chunks(2).enumerate() {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out[i] = (hi * 16 + lo) as u8;
+    }
+    Some(out)
+}
+
+/// Formats a pin the way `to_link` writes it: lowercase hex.
+pub fn format_pin_sha256(pin: &[u8; 32]) -> String {
+    pin.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

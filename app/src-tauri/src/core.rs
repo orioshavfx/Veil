@@ -65,6 +65,19 @@ pub struct UiState {
     tun_available: bool,
 }
 
+/// Snapshot of the state shown in the menu bar / tray menu.
+pub struct TrayInfo {
+    pub connected: bool,
+    pub selected: Option<Uuid>,
+    pub server_name: String,
+    pub protocol: Option<&'static str>,
+    pub mode: ConnectionMode,
+    pub preset: String,
+    pub tun_available: bool,
+    /// Servers of the selected profile's subscription (all profiles when it has none).
+    pub servers: Vec<(Uuid, String)>,
+}
+
 #[derive(Serialize)]
 pub struct Traffic {
     upload: u64,
@@ -173,6 +186,29 @@ impl Core {
 
     pub fn is_connected(&self) -> bool {
         self.conn.is_some()
+    }
+
+    /// What the tray menu shows; cheap to build, no async.
+    pub fn tray_info(&self) -> TrayInfo {
+        let selected = self.state.selected_profile();
+        let sub = selected.and_then(|p| p.subscription_id);
+        let servers = self
+            .state
+            .profiles
+            .iter()
+            .filter(|p| sub.is_none() || p.subscription_id == sub)
+            .map(|p| (p.id, p.name.clone()))
+            .collect();
+        TrayInfo {
+            connected: self.conn.is_some(),
+            selected: selected.map(|p| p.id),
+            server_name: selected.map(|p| p.name.clone()).unwrap_or_default(),
+            protocol: selected.map(|p| p.server.protocol.name()),
+            mode: self.state.settings.mode,
+            preset: self.state.settings.routing_preset.clone(),
+            tun_available: TUN_AVAILABLE,
+            servers,
+        }
     }
 
     /// Adds share links, or a subscription when given an http(s) URL.

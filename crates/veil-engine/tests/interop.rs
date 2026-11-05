@@ -277,11 +277,12 @@ async fn vless_reality_vision() {
 async fn hysteria2() {
     skip_without_xray!();
     let port = free_port();
+    let tls = tls_settings();
     let _x = start_xray(json!({
         "listen": "127.0.0.1", "port": port, "protocol": "hysteria",
         "settings": { "version": 2, "clients": [{ "auth": "secret" }] },
         "streamSettings": { "network": "hysteria", "hysteriaSettings": { "version": 2 },
-            "security": "tls", "tlsSettings": { "alpn": ["h3"], "certificates": tls_settings()["certificates"] } },
+            "security": "tls", "tlsSettings": { "alpn": ["h3"], "certificates": tls["certificates"] } },
     }))
     .await;
     // Wait until the server answers a valid probe (up to 10 s) instead of a fixed sleep.
@@ -307,4 +308,23 @@ async fn hysteria2() {
     let client = veil_proto::hysteria::HysteriaClient::new(&bad.server).unwrap();
     let err = tokio::time::timeout(Duration::from_secs(15), client.probe()).await.expect("no hang").unwrap_err();
     assert!(err.to_string().contains("authentication"), "{err}");
+
+    // Certificate pin: SHA-256 of the DER of the very certificate the server presents.
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let pem_lines = &tls["certificates"][0]["certificate"];
+    let pem = match pem_lines {
+        Value::Array(a) => a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n"),
+        other => other.as_str().expect("certificate pem").to_string(),
+    };
+    let b64: String = pem.lines().filter(|l| !l.starts_with("-----")).map(str::trim).collect();
+    let der = base64::engine::general_purpose::STANDARD.decode(b64).expect("pem base64");
+    let pin: String = Sha256::digest(&der).iter().map(|b| format!("{b:02X}")).collect();
+    // No `insecure=1`: the pin alone must be enough (the certificate is self-signed).
+    roundtrip(&format!("hysteria2://secret@127.0.0.1:{port}/?sni=localhost&pinSHA256={pin}")).await;
+    let wrong = "00".repeat(32);
+    let bad_pin = veil_config::parse_link(&format!("hysteria2://secret@127.0.0.1:{port}/?sni=localhost&insecure=1&pinSHA256={wrong}")).unwrap();
+    let client = veil_proto::hysteria::HysteriaClient::new(&bad_pin.server).unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(15), client.probe()).await.expect("no hang").unwrap_err();
+    assert!(err.to_string().contains("pinSHA256"), "{err}");
 }

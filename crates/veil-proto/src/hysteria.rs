@@ -132,11 +132,21 @@ impl HysteriaClient {
         if obfs_password.is_some() {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "hysteria2 salamander obfuscation is not supported yet"));
         }
-        let (sni, insecure) = match &server.security {
-            Security::Tls(t) => (t.sni.clone().unwrap_or_else(|| server.address.clone()), t.insecure),
-            _ => (server.address.clone(), false),
+        let (sni, insecure, pins) = match &server.security {
+            Security::Tls(t) => (t.sni.clone().unwrap_or_else(|| server.address.clone()), t.insecure, t.pin_sha256.as_slice()),
+            _ => (server.address.clone(), false, &[][..]),
         };
-        let rustls = tls::client_config(&["h3".to_string()], insecure, true)?;
+        let alpn = ["h3".to_string()];
+        let rustls = if pins.is_empty() {
+            tls::client_config(&alpn, insecure, true)?
+        } else {
+            // A pin replaces chain/name verification (like Hysteria 2 does, with or without insecure=1).
+            let pins = pins
+                .iter()
+                .map(|p| veil_config::parse_pin_sha256(p).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("hysteria: invalid pinSHA256 {p:?}"))))
+                .collect::<io::Result<Vec<_>>>()?;
+            tls::pinned_client_config(&alpn, pins, true)?
+        };
         let crypto = QuicClientConfig::try_from(rustls).map_err(io::Error::other)?;
         let mut quic = quinn::ClientConfig::new(Arc::new(crypto));
         let mut transport = quinn::TransportConfig::default();

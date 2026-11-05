@@ -140,6 +140,7 @@ fn security_from_query(
                 q.get("allowInsecure").or(q.get("insecure")).map(String::as_str),
                 Some("1" | "true")
             ),
+            pin_sha256: Vec::new(),
         })),
         "reality" => Ok(Security::Reality(RealityConfig {
             sni: non_empty(q, "sni").ok_or_else(|| invalid("reality requires sni"))?,
@@ -197,10 +198,17 @@ fn parse_hysteria2(link: &str) -> Result<Profile, LinkError> {
     }
     let p = split_url(&normalized)?;
     let q = &p.query;
-    // Pinning is not implemented: silently dropping it would turn `insecure=1&pinSHA256=..`
-    // into "verification disabled, no pin" (MITM), so refuse the link instead.
-    if q.get("pinSHA256").or_else(|| q.get("pinsha256")).is_some_and(|v| !v.is_empty()) {
-        return Err(invalid("pinSHA256 is not supported yet"));
+    // Certificate pin(s): one value in the official format, a `,`/`;` list is tolerated. A
+    // malformed pin must fail the import: dropping it would silently leave the link unpinned.
+    let mut pin_sha256 = Vec::new();
+    if let Some(raw) = q.get("pinSHA256").or_else(|| q.get("pinsha256")).filter(|v| !v.is_empty()) {
+        for part in raw.split([',', ';']).map(str::trim).filter(|p| !p.is_empty()) {
+            let pin = parse_pin_sha256(part).ok_or_else(|| invalid("pinSHA256 must be 64 hex digits (SHA-256 of the certificate)"))?;
+            pin_sha256.push(format_pin_sha256(&pin));
+        }
+        if pin_sha256.is_empty() {
+            return Err(invalid("pinSHA256 is empty"));
+        }
     }
     let obfs_password = match q.get("obfs").map(String::as_str) {
         None | Some("" | "none") => None,
@@ -223,6 +231,7 @@ fn parse_hysteria2(link: &str) -> Result<Profile, LinkError> {
             alpn: vec!["h3".into()],
             fingerprint: None,
             insecure: matches!(q.get("insecure").map(String::as_str), Some("1" | "true")),
+            pin_sha256,
         }),
     };
     Ok(Profile::new(display_name(p.name, &server), server))
@@ -409,6 +418,9 @@ pub fn to_link(profile: &Profile) -> String {
                 if t.insecure {
                     q.push(("insecure".to_string(), "1".to_string()));
                 }
+                if !t.pin_sha256.is_empty() {
+                    q.push(("pinSHA256".to_string(), t.pin_sha256.join(",")));
+                }
             }
             if let Some(pw) = obfs_password {
                 q.push(("obfs".to_string(), "salamander".to_string()));
@@ -579,7 +591,24 @@ mod tests {
         // Unsupported features must be rejected at import, not silently dropped.
         assert!(parse_link("hy2://user:pass@1.2.3.4:443?obfs=salamander&obfs-password=x").is_err());
         assert!(parse_link("hy2://user:pass@1.2.3.4:443?obfs=salamander").is_err());
+        // Certificate pin: accepted in any case / separator style, normalised, round-trips.
+        let hex = "0123456789ABCDEF".repeat(4);
+        let want = hex.to_lowercase();
+        let colon = hex.as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join(":");
+        for form in [hex.clone(), colon.clone(), colon.replace(':', "-"), want.clone()] {
+            let pp = parse_link(&format!("hy2://u@1.2.3.4:443?insecure=1&pinSHA256={form}")).unwrap();
+            let Security::Tls(t) = &pp.server.security else { panic!() };
+            assert_eq!(t.pin_sha256, vec![want.clone()], "{form}");
+            assert_eq!(parse_link(&to_link(&pp)).unwrap().server, pp.server);
+        }
+        let two = parse_link(&format!("hy2://u@1.2.3.4:443?pinSHA256={colon},{}", "ab".repeat(32))).unwrap();
+        let Security::Tls(t) = &two.server.security else { panic!() };
+        assert_eq!(t.pin_sha256.len(), 2);
+        assert_eq!(parse_link(&to_link(&two)).unwrap().server, two.server);
+        // Invalid pins must fail the import, never be dropped.
         assert!(parse_link("hy2://user:pass@1.2.3.4:443?insecure=1&pinSHA256=AA:BB").is_err());
+        assert!(parse_link(&format!("hy2://u@1.2.3.4:443?pinSHA256={}zz", "a".repeat(62))).is_err());
+        assert!(parse_link(&format!("hy2://u@1.2.3.4:443?pinSHA256={},bad", "a".repeat(64))).is_err());
         assert_eq!(parse_link("hy2://u@a%2Eb:443").unwrap().server.address, "a.b");
         assert_eq!(parse_link(&to_link(&p)).unwrap().server, p.server);
     }

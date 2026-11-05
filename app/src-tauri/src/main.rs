@@ -4,7 +4,7 @@ mod core;
 
 use std::time::Duration;
 
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, RunEvent, State, WindowEvent};
 use tokio::sync::Mutex;
@@ -12,7 +12,7 @@ use uuid::Uuid;
 use veil_config::RoutingRule;
 use veil_config::store::ConnectionMode;
 
-use crate::core::{Core, Traffic, UiState};
+use crate::core::{Core, Traffic, TrayInfo, UiState};
 
 type CoreState<'a> = State<'a, Mutex<Core>>;
 
@@ -165,28 +165,116 @@ fn tray_icon(connected: bool) -> tauri::image::Image<'static> {
 
 async fn update_tray(app: &AppHandle) {
     let core = app.state::<Mutex<Core>>();
-    let core = core.lock().await;
-    let connected = core.is_connected();
-    let server = core.state.selected_profile().map(|p| p.name.clone()).unwrap_or_default();
-    drop(core);
+    let info = core.lock().await.tray_info();
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let tip = if connected { format!("Veil — connected: {server}") } else { "Veil — disconnected".into() };
+        let tip = if info.connected { format!("Veil — Connected: {}", info.server_name) } else { "Veil — Disconnected".into() };
         let _ = tray.set_tooltip(Some(tip));
-        let _ = tray.set_icon(Some(tray_icon(connected)));
+        let _ = tray.set_icon(Some(tray_icon(info.connected)));
         #[cfg(target_os = "macos")]
         let _ = tray.set_icon_as_template(true);
-        if let Ok(menu) = tray_menu(app, connected) {
-            let _ = tray.set_menu(Some(menu));
+        match tray_menu(app, &info) {
+            Ok(menu) => {
+                let _ = tray.set_menu(Some(menu));
+            }
+            Err(e) => tracing::warn!("tray menu: {e}"),
         }
     }
     let _ = tauri::Emitter::emit(app, "state-changed", ());
 }
 
-fn tray_menu(app: &AppHandle, connected: bool) -> tauri::Result<Menu<tauri::Wry>> {
-    let toggle = MenuItem::with_id(app, "toggle", if connected { "Disconnect" } else { "Connect" }, true, None::<&str>)?;
+/// Shortens long server names for the menu.
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max - 1).collect::<String>().trim_end())
+    }
+}
+
+const MENU_MAX_SERVERS: usize = 20;
+
+fn tray_menu(app: &AppHandle, info: &TrayInfo) -> tauri::Result<Menu<tauri::Wry>> {
+    let status = if info.connected {
+        format!("Connected · {}", clip(&info.server_name, 40))
+    } else {
+        "Disconnected".to_string()
+    };
+    let header = MenuItem::with_id(app, "status", status, false, None::<&str>)?;
+    let mode_name = match info.mode {
+        ConnectionMode::Proxy => "Proxy",
+        ConnectionMode::Tun => "TUN",
+    };
+    let proto = MenuItem::with_id(
+        app,
+        "info-proto",
+        format!("{} · {mode_name}", info.protocol.unwrap_or("No server")),
+        false,
+        None::<&str>,
+    )?;
+    let preset_label = veil_config::PRESETS
+        .iter()
+        .find(|(n, _)| *n == info.preset)
+        .map(|(_, l)| *l)
+        .unwrap_or(info.preset.as_str());
+    let preset = MenuItem::with_id(app, "info-preset", format!("Routing: {preset_label}"), false, None::<&str>)?;
+    let toggle = MenuItem::with_id(app, "toggle", if info.connected { "Disconnect" } else { "Connect" }, true, None::<&str>)?;
+
+    // Server submenu.
+    let mut server_items: Vec<Box<dyn IsMenuItem<tauri::Wry>>> = Vec::new();
+    for (id, name) in info.servers.iter().take(MENU_MAX_SERVERS) {
+        let item = CheckMenuItem::with_id(app, format!("srv:{id}"), clip(name, 40), true, info.selected == Some(*id), None::<&str>)?;
+        server_items.push(Box::new(item));
+    }
+    if info.servers.is_empty() {
+        server_items.push(Box::new(MenuItem::with_id(app, "srv-none", "No servers", false, None::<&str>)?));
+    }
+    if info.servers.len() > MENU_MAX_SERVERS {
+        server_items.push(Box::new(PredefinedMenuItem::separator(app)?));
+        server_items.push(Box::new(MenuItem::with_id(app, "show", "More in Veil…", true, None::<&str>)?));
+    }
+    let server_refs: Vec<&dyn IsMenuItem<tauri::Wry>> = server_items.iter().map(|b| b.as_ref()).collect();
+    let servers = Submenu::with_items(app, "Server", true, &server_refs)?;
+
+    // Mode submenu.
+    let m_proxy = CheckMenuItem::with_id(app, "mode:proxy", "Proxy", true, info.mode == ConnectionMode::Proxy, None::<&str>)?;
+    let m_tun = CheckMenuItem::with_id(
+        app,
+        "mode:tun",
+        if info.tun_available { "TUN" } else { "TUN (unavailable)" },
+        info.tun_available,
+        info.mode == ConnectionMode::Tun,
+        None::<&str>,
+    )?;
+    let mode = Submenu::with_items(app, "Mode", true, &[&m_proxy, &m_tun])?;
+
+    // Routing presets submenu.
+    let mut preset_items: Vec<CheckMenuItem<tauri::Wry>> = Vec::new();
+    for (name, label) in veil_config::PRESETS.iter() {
+        preset_items.push(CheckMenuItem::with_id(app, format!("preset:{name}"), *label, true, info.preset == *name, None::<&str>)?);
+    }
+    let preset_refs: Vec<&dyn IsMenuItem<tauri::Wry>> = preset_items.iter().map(|i| i as &dyn IsMenuItem<tauri::Wry>).collect();
+    let routing = Submenu::with_items(app, "Routing", true, &preset_refs)?;
+
     let show = MenuItem::with_id(app, "show", "Open Veil", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Veil", true, None::<&str>)?;
-    Menu::with_items(app, &[&toggle, &show, &PredefinedMenuItem::separator(app)?, &quit])
+    Menu::with_items(
+        app,
+        &[
+            &header,
+            &proto,
+            &preset,
+            &PredefinedMenuItem::separator(app)?,
+            &toggle,
+            &PredefinedMenuItem::separator(app)?,
+            &servers,
+            &mode,
+            &routing,
+            &PredefinedMenuItem::separator(app)?,
+            &show,
+            &PredefinedMenuItem::separator(app)?,
+            &quit,
+        ],
+    )
 }
 
 fn show_window(app: &AppHandle) {
@@ -320,8 +408,8 @@ fn main() {
             TrayIconBuilder::with_id(TRAY_ID)
                 .icon(tray_icon(false))
                 .icon_as_template(cfg!(target_os = "macos"))
-                .tooltip("Veil — disconnected")
-                .menu(&tray_menu(&handle, false)?)
+                .tooltip("Veil — Disconnected")
+                .menu(&tray_menu(&handle, &app.state::<Mutex<Core>>().blocking_lock().tray_info())?)
                 // macOS: menu on any click. Windows: left click opens the window, right click the menu.
                 .show_menu_on_left_click(cfg!(target_os = "macos"))
                 .on_tray_icon_event(|tray, event| {
@@ -337,7 +425,8 @@ fn main() {
                 })
                 .on_menu_event(|app, event| {
                     let app = app.clone();
-                    match event.id.as_ref() {
+                    let id = event.id.as_ref().to_string();
+                    match id.as_str() {
                         "toggle" => {
                             tauri::async_runtime::spawn(async move {
                                 let core = app.state::<Mutex<Core>>();
@@ -353,7 +442,38 @@ fn main() {
                         }
                         "show" => show_window(&app),
                         "quit" => app.exit(0),
-                        _ => {}
+                        "mode:proxy" | "mode:tun" => {
+                            let mode = if id == "mode:tun" { ConnectionMode::Tun } else { ConnectionMode::Proxy };
+                            tauri::async_runtime::spawn(async move {
+                                let r = app.state::<Mutex<Core>>().lock().await.set_mode(mode).await;
+                                if let Err(e) = r {
+                                    tracing::error!("{e:#}");
+                                }
+                                update_tray(&app).await;
+                            });
+                        }
+                        other => {
+                            if let Some(raw) = other.strip_prefix("srv:") {
+                                if let Ok(sid) = Uuid::parse_str(raw) {
+                                    tauri::async_runtime::spawn(async move {
+                                        let r = app.state::<Mutex<Core>>().lock().await.select(sid).await;
+                                        if let Err(e) = r {
+                                            tracing::error!("{e:#}");
+                                        }
+                                        update_tray(&app).await;
+                                    });
+                                }
+                            } else if let Some(name) = other.strip_prefix("preset:") {
+                                let name = name.to_string();
+                                tauri::async_runtime::spawn(async move {
+                                    let r = app.state::<Mutex<Core>>().lock().await.set_preset(&name).await;
+                                    if let Err(e) = r {
+                                        tracing::error!("{e:#}");
+                                    }
+                                    update_tray(&app).await;
+                                });
+                            }
+                        }
                     }
                 })
                 .build(app)?;
