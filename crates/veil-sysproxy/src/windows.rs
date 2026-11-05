@@ -94,12 +94,13 @@ mod wininet {
 
     /// Sets options of the default connection and tells running apps about it.
     pub fn set(values: &[(u32, Value)]) -> Result<()> {
-        // Keep the UTF-16 buffers alive until the call returns.
+        // Keep the UTF-16 buffers alive until the call returns. "No value" is passed as an
+        // empty string, not NULL: WinINet may dereference string options unconditionally.
         let texts: Vec<Option<Vec<u16>>> = values
             .iter()
             .map(|(_, v)| match v {
-                Value::Text(Some(t)) => Some(wide(t)),
-                _ => None,
+                Value::Text(t) => Some(wide(t.as_deref().unwrap_or(""))),
+                Value::Flags(_) => None,
             })
             .collect();
         let mut opts: Vec<INTERNET_PER_CONN_OPTIONW> = values
@@ -190,7 +191,15 @@ pub fn restore(backup_path: &Path) -> Result<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e.into()),
     };
-    let b: ProxyBackup = serde_json::from_slice(&data).context("corrupt proxy backup")?;
+    let b: ProxyBackup = match serde_json::from_slice(&data) {
+        Ok(b) => b,
+        Err(e) => {
+            // Unreadable backup (crash mid-write, edited by hand): the proxy may still point at
+            // our dead port, so go DIRECT rather than leave it and fail silently.
+            tracing::warn!("corrupt proxy backup ({e}); resetting the system proxy to direct");
+            ProxyBackup { flags: wininet::PROXY_TYPE_DIRECT, ..ProxyBackup::default() }
+        }
+    };
     wininet::set(&[
         (wininet::FLAGS, Value::Flags(b.flags)),
         (wininet::SERVER, Value::Text(b.server)),

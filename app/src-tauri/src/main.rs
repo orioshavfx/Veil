@@ -221,8 +221,72 @@ fn init_logging() {
     }
 }
 
+/// Logoff / shutdown: restores the system proxy. Windows ends the session by terminating
+/// processes after `WM_ENDSESSION`; whether tao turns that into `RunEvent::Exit` is not
+/// something to rely on, and a leftover proxy on a dead port breaks the network until the
+/// next start. A hidden top-level window (message-only windows get no session messages)
+/// on its own thread handles the message and restores the settings synchronously.
+#[cfg(windows)]
+mod session_end {
+    use std::path::PathBuf;
+    use std::ptr::{null, null_mut};
+    use std::sync::OnceLock;
+
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, MSG, RegisterClassW, TranslateMessage,
+        WM_ENDSESSION, WNDCLASSW, WS_OVERLAPPED,
+    };
+
+    static BACKUP: OnceLock<PathBuf> = OnceLock::new();
+
+    unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        // wparam != 0: the session really ends (the query may have been vetoed by another app).
+        if msg == WM_ENDSESSION && wparam != 0 {
+            if let Some(path) = BACKUP.get() {
+                let _ = veil_sysproxy::restore(path);
+            }
+            return 0;
+        }
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    pub fn start() {
+        let Ok(store) = veil_config::store::Store::open_default() else { return };
+        let _ = BACKUP.set(store.dir().join("sysproxy-backup.json"));
+        let spawned = std::thread::Builder::new().name("session-end".into()).spawn(|| unsafe {
+            let class: Vec<u16> = "VeilSessionEnd".encode_utf16().chain(std::iter::once(0)).collect();
+            let hinstance = GetModuleHandleW(null());
+            let mut wc: WNDCLASSW = std::mem::zeroed();
+            wc.lpfnWndProc = Some(wndproc);
+            wc.hInstance = hinstance;
+            wc.lpszClassName = class.as_ptr();
+            if RegisterClassW(&wc) == 0 {
+                tracing::warn!("session-end window: RegisterClassW failed");
+                return;
+            }
+            let hwnd = CreateWindowExW(0, class.as_ptr(), class.as_ptr(), WS_OVERLAPPED, 0, 0, 0, 0, null_mut(), null_mut(), hinstance, null());
+            if hwnd.is_null() {
+                tracing::warn!("session-end window: CreateWindowExW failed");
+                return;
+            }
+            let mut msg: MSG = std::mem::zeroed();
+            while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        });
+        if let Err(e) = spawned {
+            tracing::warn!("session-end thread: {e}");
+        }
+    }
+}
+
 fn main() {
     init_logging();
+    #[cfg(windows)]
+    session_end::start();
     tracing::info!("Veil {} starting", env!("CARGO_PKG_VERSION"));
     let core = Core::open().expect("cannot open settings");
 

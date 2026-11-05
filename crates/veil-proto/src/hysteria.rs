@@ -103,6 +103,12 @@ impl Drop for SessionGuard {
     }
 }
 
+/// Adds the failed stage (resolve / bind / handshake / h3 / auth) and the peer to an error,
+/// keeping its `ErrorKind`, so veil.log shows where a connection attempt died.
+fn stage(stage: &str, peer: impl std::fmt::Display, e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("hysteria: {stage} [{peer}]: {e}"))
+}
+
 fn timed_out(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, format!("hysteria: {what} timed out"))
 }
@@ -141,6 +147,14 @@ impl HysteriaClient {
             .stream_receive_window((8u32 << 20).into())
             .receive_window((20u32 << 20).into())
             .max_concurrent_bidi_streams(1024u32.into());
+        // Windows sets the don't-fragment bit on every datagram; an MTU probe above the real
+        // path/interface MTU (VPN, PPPoE, Wi-Fi) fails locally there (WSAEMSGSIZE) instead of
+        // being silently dropped. Hysteria2 TCP proxying needs no big packets, so cap probes.
+        if cfg!(windows) {
+            let mut mtu = quinn::MtuDiscoveryConfig::default();
+            mtu.upper_bound(1350);
+            transport.mtu_discovery_config(Some(mtu));
+        }
         quic.transport_config(Arc::new(transport));
         Ok(Self {
             address: server.address.clone(),
@@ -162,31 +176,56 @@ impl HysteriaClient {
     /// Opens a UDP socket and completes the QUIC handshake with one address.
     async fn quic_connect(&self, addr: SocketAddr) -> io::Result<(quinn::Endpoint, quinn::Connection)> {
         // Pinned to the physical interface in TUN mode, like every other socket of ours.
+        // The local socket family always follows the server address (0.0.0.0 for IPv4, [::] for
+        // IPv6; see `dial::udp_socket_with`): on Windows a v6 socket is V6ONLY and cannot reach v4.
         let socket = match &self.pin {
-            Some(pin) => dial::udp_socket_with(addr.ip(), Some(pin)).await?,
-            None => dial::udp_socket_for(addr.ip()).await?,
+            Some(pin) => dial::udp_socket_with(addr.ip(), Some(pin)).await,
+            None => dial::udp_socket_for(addr.ip()).await,
         }
-        .into_std()?;
+        .and_then(|s| s.into_std())
+        .map_err(|e| stage("bind (UDP socket)", addr, e))?;
+        let local = socket.local_addr().map(|a| a.to_string()).unwrap_or_default();
         let mut endpoint = quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
             None,
             socket,
             Arc::new(quinn::TokioRuntime),
-        )?;
+        )
+        .map_err(|e| stage("bind (QUIC endpoint)", format!("{local} -> {addr}"), e))?;
         endpoint.set_default_client_config(self.quic.clone());
-        let conn = tokio::time::timeout(dial::CONNECT_TIMEOUT, endpoint.connect(addr, &self.sni).map_err(io::Error::other)?)
+        let conn = tokio::time::timeout(dial::CONNECT_TIMEOUT, endpoint.connect(addr, &self.sni).map_err(|e| err(format!("handshake [{local} -> {addr}]: {e}")))?)
             .await
-            .map_err(|_| err("QUIC handshake timed out (UDP blocked?)"))?
-            .map_err(|e| err(format!("QUIC handshake: {e}")))?;
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("hysteria: handshake [{local} -> {addr}, sni {}] timed out (UDP blocked / firewall?)", self.sni),
+                )
+            })?
+            .map_err(|e| err(format!("handshake [{local} -> {addr}, sni {}]: {e}", self.sni)))?;
         Ok((endpoint, conn))
     }
 
+    /// [`Self::connect_session_inner`] plus a warn-level log line, so a failing server shows
+    /// its stage and address in veil.log (the callers only log at debug level).
     async fn connect_session(&self) -> io::Result<Session> {
+        let r = self.connect_session_inner().await;
+        if let Err(e) = &r {
+            tracing::warn!("{e}");
+        }
+        r
+    }
+
+    async fn connect_session_inner(&self) -> io::Result<Session> {
         let target = Address::from_host(&self.address, self.port);
-        let addrs = match &self.pin {
-            Some(pin) => dial::resolve_with(&target, Some(pin)).await?,
-            None => dial::resolve(&target).await?,
-        };
+        let mut addrs = match &self.pin {
+            Some(pin) => dial::resolve_with(&target, Some(pin)).await,
+            None => dial::resolve(&target).await,
+        }
+        .map_err(|e| stage("resolve", format!("{}:{}", self.address, self.port), e))?;
+        // IPv4 first (stable sort): a dead AAAA must not cost a full handshake timeout
+        // before the working A record is tried (Windows resolvers list IPv6 first).
+        addrs.sort_by_key(|a| a.is_ipv6());
+        tracing::info!("hysteria: {}:{} resolved to {addrs:?}", self.address, self.port);
         // Try each resolved address in turn (e.g. an AAAA without a route must not block the A record).
         // An overall budget keeps a server with many dead addresses from holding the session
         // lock for 10 s per address; the first attempt always runs.
@@ -202,7 +241,10 @@ impl HysteriaClient {
                     established = Some(parts);
                     break;
                 }
-                Err(e) => last_err = Some(e),
+                Err(e) => {
+                    tracing::info!("hysteria: {e}");
+                    last_err = Some(e);
+                }
             }
         }
         let (endpoint, conn) = match established {
@@ -217,11 +259,11 @@ impl HysteriaClient {
             Ok(Ok(parts)) => parts,
             Ok(Err(e)) => {
                 conn.close(0u32.into(), b"");
-                return Err(err(format!("HTTP/3: {e}")));
+                return Err(err(format!("HTTP/3 setup [{}]: {e}", conn.remote_address())));
             }
             Err(_) => {
                 conn.close(0u32.into(), b"");
-                return Err(timed_out("HTTP/3 setup"));
+                return Err(timed_out(&format!("HTTP/3 setup [{}]", conn.remote_address())));
             }
         };
         let guard = SessionGuard {
@@ -237,18 +279,19 @@ impl HysteriaClient {
             .body(())
             .map_err(io::Error::other)?;
         let sent = std::time::Instant::now();
+        let peer = conn.remote_address();
         let response = tokio::time::timeout(dial::CONNECT_TIMEOUT, async {
-            let mut stream = send_request.send_request(request).await.map_err(|e| err(format!("auth request: {e}")))?;
-            stream.finish().await.map_err(|e| err(format!("auth request: {e}")))?;
-            stream.recv_response().await.map_err(|e| err(format!("auth response: {e}")))
+            let mut stream = send_request.send_request(request).await.map_err(|e| err(format!("auth request [{peer}]: {e}")))?;
+            stream.finish().await.map_err(|e| err(format!("auth request [{peer}]: {e}")))?;
+            stream.recv_response().await.map_err(|e| err(format!("auth response [{peer}]: {e}")))
         })
         .await
-        .map_err(|_| timed_out("authentication"))??;
+        .map_err(|_| timed_out(&format!("authentication [{peer}]")))??;
         let auth_rtt = sent.elapsed();
         if response.status().as_u16() != AUTH_OK {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("hysteria: authentication failed (HTTP {})", response.status()),
+                format!("hysteria: authentication failed [{peer}] (HTTP {})", response.status()),
             ));
         }
         Ok(Session { conn, _endpoint: endpoint, _h3: send_request, driver: guard.disarm(), auth_rtt })
@@ -299,7 +342,7 @@ impl HysteriaClient {
     /// Establishes the QUIC connection ahead of the first request.
     pub async fn warm_up(&self) {
         if let Err(e) = self.connection().await {
-            tracing::debug!("hysteria warm-up: {e}");
+            tracing::debug!("hysteria warm-up: {e}"); // already logged at warn by connect_session
         }
     }
 

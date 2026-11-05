@@ -93,4 +93,25 @@ mod tests {
         t6.extend(row);
         assert_eq!(find_pid(&t6, UDP6, "[::1]:443".parse().unwrap()), Some(5));
     }
+
+    #[test]
+    fn tcp6_rows_skip_pid_zero_and_map_v4() {
+        let row = |addr: Ipv6Addr, port: u16, pid: u32| {
+            let mut r = vec![0u8; TCP6.row];
+            r[..16].copy_from_slice(&addr.octets());
+            r[20..22].copy_from_slice(&port.to_be_bytes());
+            r[52..56].copy_from_slice(&pid.to_le_bytes());
+            r
+        };
+        let mapped = "::ffff:127.0.0.1".parse::<Ipv6Addr>().unwrap();
+        let mut t = 3u32.to_le_bytes().to_vec();
+        t.extend(row("::1".parse().unwrap(), 4000, 11));
+        t.extend(row(mapped, 5000, 0)); // TIME_WAIT leftover
+        t.extend(row(mapped, 5000, 12)); // live owner
+        assert_eq!(find_pid(&t, TCP6, "[::1]:4000".parse().unwrap()), Some(11));
+        // A v4 client on a dual-stack socket; the pid-0 row is skipped.
+        assert_eq!(find_pid(&t, TCP6, "127.0.0.1:5000".parse().unwrap()), Some(12));
+        assert_eq!(find_pid(&t, TCP6, "[::1]:5000".parse().unwrap()), None);
+        assert_eq!(find_pid(&t[..50], TCP6, "[::1]:4000".parse().unwrap()), None);
+    }
 }

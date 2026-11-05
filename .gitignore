@@ -18,3 +18,7 @@ veil-watch.sh
 
 # Registry marker inside the vendored crate
 vendor/ipstack/.cargo-ok
+veil-build-windows.flag
+veil-build-windows.log
+veil-build-windows.log.tmp
+veil-watch.command

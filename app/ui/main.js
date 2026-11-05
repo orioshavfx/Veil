@@ -62,6 +62,31 @@ function el(tag, cls, text) {
   return e;
 }
 
+// Windows has no flag glyphs: a regional-indicator pair renders as bare letters
+// ("EU", "PL"). There, draw each pair as a small country-code badge instead.
+// Elsewhere (macOS has Apple Color Emoji flags) the text is left untouched.
+const NO_FLAG_FONT = /Windows/i.test(navigator.userAgent);
+const FLAG_RE = /([\u{1F1E6}-\u{1F1FF}])([\u{1F1E6}-\u{1F1FF}])/gu;
+function setName(node, text) {
+  text = String(text);
+  if (!NO_FLAG_FONT || !FLAG_RE.test(text)) {
+    FLAG_RE.lastIndex = 0;
+    node.textContent = text;
+    return node;
+  }
+  FLAG_RE.lastIndex = 0;
+  node.textContent = '';
+  let last = 0;
+  for (const m of text.matchAll(FLAG_RE)) {
+    if (m.index > last) node.append(text.slice(last, m.index));
+    const code = [...m[0]].map((c) => String.fromCharCode(c.codePointAt(0) - 0x1F1E6 + 65)).join('');
+    node.append(el('span', 'flag-code', code));
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) node.append(text.slice(last));
+  return node;
+}
+
 async function reload() {
   state = await invoke('snapshot');
   render();
@@ -109,7 +134,7 @@ function render() {
   $('status').textContent = busyLabel || (s.connected ? 'Connected' : 'Disconnected');
   $('power').setAttribute('aria-label', s.connected ? 'Disconnect' : 'Connect');
   const current = s.profiles.find((p) => p.id === s.selected);
-  $('current').textContent = current ? current.name : 'No server selected';
+  setName($('current'), current ? current.name : 'No server selected');
   const presetName = (s.presets.find(([n]) => n === s.preset) || [])[1] || '';
   $('caption').textContent = `${MODE_NAMES[s.mode]} · ${presetName}`;
   if (!s.connected) {
@@ -158,7 +183,7 @@ function renderGroups() {
 function renderGroup({ sub, title, items }) {
   const g = el('section', 'group');
   const head = el('div', 'group-head');
-  head.append(el('div', 'group-title', title));
+  head.append(setName(el('div', 'group-title'), title));
   if (sub) {
     const del = el('button', 'icon-btn', '✕');
     del.title = 'Remove subscription';
@@ -194,7 +219,7 @@ function renderRow(p) {
   row.tabIndex = 0;
   row.setAttribute('role', 'button');
   const main = el('div', 'row-main');
-  main.append(el('div', 'row-name', p.name));
+  main.append(setName(el('div', 'row-name'), p.name));
   const kind = [p.protocol.toUpperCase(), SECURITY[p.security]].filter(Boolean).join(' · ');
   main.append(el('div', 'row-sub', kind));
 
