@@ -1,18 +1,91 @@
-//! Windows: system proxy via WinINet per-connection options (like v2rayN).
-//! TUN routes and DNS come in stage W2; until then those calls fail, and
-//! restores succeed as no-ops when there is nothing to undo, because the app
-//! calls them on every start.
+//! Windows: system proxy via WinINet per-connection options (like v2rayN),
+//! and TUN routes/DNS via PowerShell's NetTCPIP cmdlets (needs administrator).
+//!
+//! Nothing here touches physical adapters' DNS or the default route: the TUN
+//! adapter gets on-link split routes and its own DNS, and disappears on exit.
 
+use std::io::Read;
 use std::net::IpAddr;
+use std::num::NonZeroU32;
+use std::os::windows::process::CommandExt;
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::TunRoutes;
+use crate::winnet;
 
-fn unsupported<T>(what: &str) -> Result<T> {
-    bail!("{what} is not supported on Windows yet")
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const CMD_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Name of the TUN adapter set up by [`add_tun_routes`]; DNS is applied to it only.
+static TUN_NAME: Mutex<Option<String>> = Mutex::new(None);
+
+fn powershell_path() -> std::path::PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(|r| Path::new(&r).join(r"System32\WindowsPowerShell\v1.0\powershell.exe"))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| "powershell.exe".into())
+}
+
+/// Runs `cmd` without a console window; kills it after `timeout`.
+/// Returns (success, stdout, stderr).
+fn run_cmd(mut cmd: Command, timeout: Duration) -> Result<(bool, String, String)> {
+    cmd.creation_flags(CREATE_NO_WINDOW).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().context("cannot start command")?;
+    let mut out = child.stdout.take().context("no stdout")?;
+    let mut err = child.stderr.take().context("no stderr")?;
+    let t_out = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = out.read_to_end(&mut b);
+        b
+    });
+    let t_err = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = err.read_to_end(&mut b);
+        b
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break Some(st);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    };
+    let decode = |b: Vec<u8>| String::from_utf8_lossy(&b).trim_start_matches('\u{feff}').to_string();
+    let stdout = decode(t_out.join().unwrap_or_default());
+    let stderr = decode(t_err.join().unwrap_or_default());
+    match status {
+        Some(st) => Ok((st.success(), stdout, stderr)),
+        None => bail!("command timed out after {}s", timeout.as_secs()),
+    }
+}
+
+/// Runs a PowerShell script (single-quoted strings only, no shell involved).
+/// `env` passes values the script reads from `$env:`.
+fn ps(script: &str, env: &[(&str, &str)]) -> Result<String> {
+    let full = format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {script}");
+    let mut cmd = Command::new(powershell_path());
+    cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", full.as_str()]);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let (ok, stdout, stderr) = run_cmd(cmd, CMD_TIMEOUT).context("PowerShell")?;
+    if !ok {
+        let msg = if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() };
+        let msg: String = msg.chars().take(600).collect();
+        bail!("PowerShell failed: {msg}");
+    }
+    Ok(stdout)
 }
 
 /// Hosts that never go through the proxy. WinINet takes `*` masks, not CIDR.
@@ -210,58 +283,139 @@ pub fn restore(backup_path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-pub fn services() -> Result<Vec<String>> {
-    unsupported("network services")
-}
-
-pub fn primary_service() -> Option<String> {
-    None
-}
-
-pub fn default_interface() -> Result<String> {
-    unsupported("finding the default interface")
-}
-
-pub fn default_gateway() -> Result<IpAddr> {
-    unsupported("finding the default gateway")
-}
-
-pub fn system_dns() -> Result<Vec<IpAddr>> {
-    unsupported("reading DNS servers")
-}
-
-pub fn dns_override(_servers: &[IpAddr], _backup_path: &Path) -> Result<()> {
-    unsupported("changing DNS servers")
-}
-
-pub fn dns_restore(backup_path: &Path) -> Result<bool> {
-    if backup_path.exists() {
-        return unsupported("restoring DNS servers");
+fn default_routes() -> Result<Vec<winnet::DefaultRoute>> {
+    let routes = winnet::parse_default_routes(&ps(winnet::DEFAULT_ROUTES_SCRIPT, &[])?);
+    if routes.is_empty() {
+        bail!("no default route (offline?)");
     }
-    Ok(false)
+    Ok(routes)
 }
 
-pub fn flush_dns_cache() {}
+/// Interface alias of the best IPv4 default route, e.g. `Ethernet`.
+pub fn default_interface() -> Result<String> {
+    let routes = default_routes()?;
+    Ok(winnet::best_default(&routes).context("no default route (offline?)")?.alias.clone())
+}
+
+/// Index of the IPv4 interface with this alias.
+pub fn interface_index(name: &str) -> Result<NonZeroU32> {
+    winnet::validate_alias(name)?;
+    let out = ps(winnet::INTERFACE_INDEX_SCRIPT, &[("VEIL_IF", name)])?;
+    winnet::parse_index(&out).with_context(|| format!("unknown interface {name}"))
+}
+
+/// Like [`interface_index`], but waits for a freshly created adapter to show up.
+fn wait_interface_index(name: &str) -> Result<NonZeroU32> {
+    let mut last = None;
+    for _ in 0..10 {
+        match interface_index(name) {
+            Ok(i) => return Ok(i),
+            Err(e) => last = Some(e),
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("unknown interface {name}")))
+}
+
+/// Gateway of the best IPv4 default route.
+pub fn default_gateway() -> Result<IpAddr> {
+    let routes = default_routes()?;
+    let best = winnet::best_default(&routes).context("no default route (offline?)")?;
+    if best.next_hop.is_unspecified() {
+        bail!("default route has no gateway");
+    }
+    Ok(best.next_hop)
+}
+
+/// DNS servers configured on the interface carrying the default route.
+pub fn system_dns() -> Result<Vec<IpAddr>> {
+    let routes = default_routes()?;
+    let best = winnet::best_default(&routes).context("no default route (offline?)")?;
+    Ok(winnet::parse_ip_lines(&ps(&winnet::dns_of_interface_script(best.index), &[])?))
+}
+
+/// Points the TUN adapter (named by an earlier [`add_tun_routes`]) at `servers`.
+/// Physical adapters are left alone and the adapter vanishes on exit, so
+/// there is nothing to back up.
+pub fn dns_override(servers: &[IpAddr], _backup_path: &Path) -> Result<()> {
+    let name = TUN_NAME.lock().unwrap().clone().context("TUN adapter is not set up yet")?;
+    let idx = interface_index(&name)?;
+    ps(&winnet::set_dns_script(idx.get(), servers), &[]).context("cannot set DNS on the TUN adapter")?;
+    flush_dns_cache();
+    Ok(())
+}
+
+/// Resets DNS on the TUN adapter if it still exists. Idempotent. A stale
+/// backup file from other platforms' logic is simply deleted.
+pub fn dns_restore(backup_path: &Path) -> Result<bool> {
+    let _ = std::fs::remove_file(backup_path);
+    let Some(name) = TUN_NAME.lock().unwrap().take() else { return Ok(false) };
+    // The adapter is usually gone by now; the lookup is by name, so a reused index is never touched.
+    let Ok(idx) = interface_index(&name) else { return Ok(false) };
+    if let Err(e) = ps(&winnet::reset_dns_script(idx.get()), &[]) {
+        tracing::warn!("{e:#}");
+        return Ok(false);
+    }
+    flush_dns_cache();
+    Ok(true)
+}
+
+pub fn flush_dns_cache() {
+    let mut cmd = Command::new("ipconfig.exe");
+    cmd.arg("/flushdns");
+    let _ = run_cmd(cmd, Duration::from_secs(10));
+}
 
 pub fn foreign_split_routes(_own_iface: &str) -> Result<Vec<String>> {
     Ok(Vec::new())
 }
 
-pub fn add_tun_routes(_iface: &str, _routes: TunRoutes) -> Result<()> {
-    unsupported("TUN routes")
+/// Sends traffic into the TUN adapter `iface` with on-link split routes (`0/1`,
+/// `128/1`, IPv6 `::/1`, `8000::/1`); the real default route stays untouched.
+/// The adapter also gets the lowest interface metric so its DNS is preferred.
+pub fn add_tun_routes(iface: &str, routes: TunRoutes) -> Result<()> {
+    winnet::validate_alias(iface)?;
+    *TUN_NAME.lock().unwrap() = Some(iface.to_string());
+    let idx = wait_interface_index(iface)?;
+    ps(&winnet::add_routes_script(idx.get(), routes), &[])
+        .with_context(|| format!("cannot add TUN routes (administrator rights needed) on {iface}"))?;
+    Ok(())
 }
 
-pub fn remove_tun_routes(_iface: &str) {}
+/// Best effort and idempotent: the routes also disappear with the adapter.
+pub fn remove_tun_routes(iface: &str) {
+    if winnet::validate_alias(iface).is_err() {
+        return;
+    }
+    let Ok(idx) = interface_index(iface) else { return };
+    if let Err(e) = ps(&winnet::remove_routes_script(idx.get()), &[]) {
+        tracing::warn!("{e:#}");
+    }
+}
 
-/// Not needed on Windows: the physical default route stays in place.
+/// Not needed on Windows: sockets are pinned with `IP_UNICAST_IF`.
 pub fn add_scoped_default(_phys: &str, _gateway: IpAddr) -> bool {
     false
 }
 
 pub fn remove_scoped_default(_phys: &str) {}
 
-pub fn add_host_route(_ip: IpAddr, _gateway: IpAddr) -> bool {
-    false
+/// Host route to the proxy server through the original gateway and its interface.
+pub fn add_host_route(ip: IpAddr, gateway: IpAddr) -> bool {
+    if !ip.is_ipv4() || !gateway.is_ipv4() {
+        return false;
+    }
+    match ps(&winnet::add_host_route_script(ip, gateway), &[]) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("host route to {ip}: {e:#}");
+            false
+        }
+    }
 }
 
-pub fn remove_host_route(_ip: IpAddr) {}
+pub fn remove_host_route(ip: IpAddr) {
+    if ip.is_ipv4() && let Err(e) = ps(&winnet::remove_host_route_script(ip), &[]) {
+        tracing::warn!("{e:#}");
+    }
+}

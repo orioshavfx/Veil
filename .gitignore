@@ -10,6 +10,9 @@ app/src-tauri/gen/
 app/src-tauri/resources/geoip.dat
 app/src-tauri/resources/geosite.dat
 
+# Windows TUN driver DLL: downloaded by app/fetch-wintun.sh
+app/src-tauri/resources/wintun.dll
+
 # Local build-check helpers (not part of the project)
 veil-check.sh
 veil-check.log

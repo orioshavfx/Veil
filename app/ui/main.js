@@ -18,7 +18,7 @@ const MODE_DESC = {
   },
   windows: {
     proxy: 'Uses the Windows system proxy. No administrator rights needed.',
-    tun: 'TUN for Windows is not available yet. Use Proxy.',
+    tun: 'Routes all traffic, including apps that ignore the proxy. Asks for administrator permission.',
   },
 };
 const ROUTING_DESC = {

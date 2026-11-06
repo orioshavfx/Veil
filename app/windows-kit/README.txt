@@ -1,12 +1,12 @@
-Veil for Windows — stage W1 test build (app + system proxy)
+Veil for Windows — test build (app + system proxy + TUN)
 
 What works: the Veil app (window + tray icon), subscriptions, all protocols
 (VLESS/REALITY/Vision, VMess, Trojan, Shadowsocks, Hysteria2), Proxy mode with
-the Windows system proxy, site and app rules.
-Not yet: TUN mode (its button is greyed out).
+the Windows system proxy, TUN mode, site and app rules.
 
 Files: Veil.exe (the app), veil-cli.exe (command-line tool for the test script),
-geo\ (site/IP lists). Keep them together in one folder.
+wintun.dll (TUN driver, needed for TUN mode), geo\ (site/IP lists).
+Keep them together in one folder.
 
 1. Unzip this folder anywhere (e.g. Documents\Veil).
 2. Windows may block files downloaded from the internet. In PowerShell, in this folder:
@@ -29,5 +29,18 @@ geo\ (site/IP lists). Keep them together in one folder.
      and sites open normally without Veil.
    - Switch Windows between light and dark mode: the tray icon should stay visible.
 
-5. Send back: veil-report.txt, %LOCALAPPDATA%\Veil\veil.log (paste that path
+5. TUN mode (all traffic, including apps that ignore the proxy):
+   - wintun.dll must be next to Veil.exe, otherwise Veil says
+     "wintun.dll not found next to Veil.exe".
+   - Settings -> Mode -> TUN, then press the power button. Windows shows the
+     UAC prompt; Veil restarts with administrator rights and connects by itself.
+     If you decline the prompt, Veil stays as it was and shows
+     "Administrator permission was declined".
+   - Check https://api.ipify.org: it should show the server's IP. The system
+     proxy stays off in TUN mode.
+   - To undo everything: press the power button again or Quit Veil from the tray.
+     If something went wrong, just close the app (the TUN adapter disappears with it).
+     Next time you start Veil normally (no administrator) in Proxy mode.
+
+6. Send back: veil-report.txt, %LOCALAPPDATA%\Veil\veil.log (paste that path
    into the Explorer address bar), and a note on anything that looked wrong.

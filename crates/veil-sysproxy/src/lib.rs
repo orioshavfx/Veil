@@ -34,6 +34,8 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::*;
 
+#[cfg(any(windows, test))]
+mod winnet;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]

@@ -57,8 +57,13 @@ async fn select_profile(app: AppHandle, core: CoreState<'_>, id: Uuid) -> Result
 
 #[tauri::command]
 async fn set_mode(app: AppHandle, core: CoreState<'_>, mode: ConnectionMode) -> Result<(), String> {
-    let r = core.lock().await.set_mode(mode).await.map_err(msg);
+    let (r, relaunch) = {
+        let mut c = core.lock().await;
+        let r = c.set_mode(mode).await.map_err(msg);
+        (r, c.take_relaunch())
+    };
     update_tray(&app).await;
+    quit_for_relaunch(&app, relaunch);
     r
 }
 
@@ -94,9 +99,24 @@ async fn list_apps() -> Result<Vec<veil_engine::process::AppEntry>, String> {
 
 #[tauri::command]
 async fn connect(app: AppHandle, core: CoreState<'_>) -> Result<(), String> {
-    let r = core.lock().await.connect().await.map_err(msg);
+    let (r, relaunch) = {
+        let mut c = core.lock().await;
+        let r = c.connect().await.map_err(msg);
+        (r, c.take_relaunch())
+    };
     update_tray(&app).await;
+    quit_for_relaunch(&app, relaunch);
     r
+}
+
+/// Windows TUN: an elevated copy of the app has been started through UAC. Free the
+/// single-instance lock (the new copy waits for it) and quit; nothing is connected here.
+fn quit_for_relaunch(app: &AppHandle, relaunch: bool) {
+    if relaunch {
+        #[cfg(windows)]
+        single_instance::release();
+        app.exit(0);
+    }
 }
 
 #[tauri::command]
@@ -376,23 +396,44 @@ mod session_end {
 #[cfg(windows)]
 mod single_instance {
     use std::ptr::null_mut;
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    use std::time::{Duration, Instant};
 
-    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError};
     use windows_sys::Win32::System::Threading::CreateMutexW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow};
 
-    /// Returns false when another Veil is already running.
-    pub fn acquire() -> bool {
+    /// The mutex handle, kept open for the life of the process (until `release`).
+    static HANDLE: AtomicIsize = AtomicIsize::new(0);
+
+    /// Returns false when another Veil is already running. With `wait`, a copy that is
+    /// about to quit (the non-elevated one that started us through UAC) gets that long
+    /// to let go of the lock.
+    pub fn acquire(wait: Duration) -> bool {
         let name: Vec<u16> = "Local\\dev.veil.app.single-instance".encode_utf16().chain(std::iter::once(0)).collect();
+        let deadline = Instant::now() + wait;
+        loop {
+            unsafe {
+                let handle = CreateMutexW(null_mut(), 0, name.as_ptr());
+                let err = GetLastError();
+                if handle.is_null() {
+                    // An elevated copy owns it and we may not open it: it is running.
+                    if err != ERROR_ACCESS_DENIED {
+                        return true; // cannot tell: better two windows than none
+                    }
+                } else if err != ERROR_ALREADY_EXISTS {
+                    HANDLE.store(handle as isize, Ordering::SeqCst);
+                    return true;
+                } else {
+                    CloseHandle(handle);
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
         unsafe {
-            let handle = CreateMutexW(null_mut(), 0, name.as_ptr());
-            if handle.is_null() {
-                return true; // cannot tell: better two windows than none
-            }
-            // The handle is kept open for the life of the process on purpose.
-            if GetLastError() != ERROR_ALREADY_EXISTS {
-                return true;
-            }
             let title: Vec<u16> = "Veil".encode_utf16().chain(std::iter::once(0)).collect();
             let hwnd = FindWindowW(null_mut(), title.as_ptr());
             if !hwnd.is_null() {
@@ -400,14 +441,23 @@ mod single_instance {
                 ShowWindow(hwnd, SW_RESTORE);
                 SetForegroundWindow(hwnd);
             }
-            false
+        }
+        false
+    }
+
+    /// Lets go of the lock so that the elevated copy can take it.
+    pub fn release() {
+        let handle = HANDLE.swap(0, Ordering::SeqCst);
+        if handle != 0 {
+            unsafe { CloseHandle(handle as _) };
         }
     }
 }
 
 fn main() {
+    let connect_tun = core::wants_connect_tun(std::env::args().skip(1));
     #[cfg(windows)]
-    if !single_instance::acquire() {
+    if !single_instance::acquire(if connect_tun { Duration::from_secs(5) } else { Duration::ZERO }) {
         return;
     }
     init_logging();
@@ -437,7 +487,7 @@ fn main() {
             traffic,
             ping_all,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             if let Ok(dir) = app.path().resource_dir() {
                 let core = app.state::<Mutex<Core>>();
                 tauri::async_runtime::block_on(async { core.lock().await.seed_geo(&dir.join("geo")) });
@@ -474,8 +524,10 @@ fn main() {
                                 } else if let Err(e) = c.connect().await {
                                     tracing::error!("{e:#}");
                                 }
+                                let relaunch = c.take_relaunch();
                                 drop(c);
                                 update_tray(&app).await;
+                                quit_for_relaunch(&app, relaunch);
                             });
                         }
                         "show" => show_window(&app),
@@ -483,11 +535,16 @@ fn main() {
                         "mode:proxy" | "mode:tun" => {
                             let mode = if id == "mode:tun" { ConnectionMode::Tun } else { ConnectionMode::Proxy };
                             tauri::async_runtime::spawn(async move {
-                                let r = app.state::<Mutex<Core>>().lock().await.set_mode(mode).await;
+                                let (r, relaunch) = {
+                                    let core = app.state::<Mutex<Core>>();
+                                    let mut c = core.lock().await;
+                                    (c.set_mode(mode).await, c.take_relaunch())
+                                };
                                 if let Err(e) = r {
                                     tracing::error!("{e:#}");
                                 }
                                 update_tray(&app).await;
+                                quit_for_relaunch(&app, relaunch);
                             });
                         }
                         other => {
@@ -529,6 +586,20 @@ fn main() {
                             update_tray(&handle).await;
                         }
                     }
+                });
+            }
+
+            // Started elevated by the app itself (Windows TUN): connect right away.
+            if connect_tun {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    {
+                        let core = handle.state::<Mutex<Core>>();
+                        if let Err(e) = core.lock().await.connect_after_elevation().await {
+                            tracing::error!("{e:#}");
+                        }
+                    }
+                    update_tray(&handle).await;
                 });
             }
 

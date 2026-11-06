@@ -13,6 +13,8 @@ use veil_config::{PRESETS, RoutingRule, Subscription, SubscriptionUsage, geodata
 use veil_engine::rules::Rules;
 use veil_engine::{Engine, EngineConfig};
 
+/// `Tun` (through the privileged helper) exists on macOS only; Windows runs TUN inside the app.
+#[cfg_attr(windows, allow(dead_code))]
 enum Conn {
     Proxy { engine: Box<Engine>, sysproxy: bool },
     Tun,
@@ -24,6 +26,10 @@ pub struct Core {
     conn: Option<Conn>,
     connected_at: Option<Instant>,
     last_error: Option<String>,
+    /// Set after the app started an elevated copy of itself and should now quit.
+    relaunch: bool,
+    /// Started by `--connect-tun`: never ask for elevation again (no UAC loops).
+    no_relaunch: bool,
 }
 
 #[derive(Serialize)]
@@ -61,7 +67,7 @@ pub struct UiState {
     port: u16,
     /// `macos` or `windows`, for platform-specific texts in the UI.
     platform: &'static str,
-    /// TUN mode needs the privileged helper, which Windows does not have yet.
+    /// TUN mode: macOS (privileged helper) and Windows (elevated app + wintun.dll).
     tun_available: bool,
 }
 
@@ -86,6 +92,7 @@ pub struct Traffic {
     connected: bool,
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 pub enum TrafficSource {
     Proxy(std::sync::Arc<veil_engine::Stats>, u64),
     Tun(u64),
@@ -126,7 +133,7 @@ impl Core {
         }
         // Leftovers of a crash: put the user's proxy settings back.
         let _ = veil_sysproxy::restore(&store.dir().join("sysproxy-backup.json"));
-        Ok(Self { store, state, conn: None, connected_at: None, last_error: None })
+        Ok(Self { store, state, conn: None, connected_at: None, last_error: None, relaunch: false, no_relaunch: false })
     }
 
     fn save(&self) -> Result<()> {
@@ -182,6 +189,22 @@ impl Core {
             platform: std::env::consts::OS,
             tun_available: TUN_AVAILABLE,
         }
+    }
+
+    /// True once (and only once) after `connect` started an elevated copy of the app:
+    /// the caller must release its single-instance lock and quit.
+    pub fn take_relaunch(&mut self) -> bool {
+        std::mem::take(&mut self.relaunch)
+    }
+
+    /// Connect right after an elevated start (`--connect-tun`): TUN only if the saved
+    /// mode is TUN, and never asks for elevation again.
+    pub async fn connect_after_elevation(&mut self) -> Result<()> {
+        self.no_relaunch = true;
+        if self.state.settings.mode != ConnectionMode::Tun || self.conn.is_some() {
+            return Ok(());
+        }
+        self.connect().await
     }
 
     pub fn is_connected(&self) -> bool {
@@ -445,6 +468,7 @@ impl Core {
         );
         let result = self.connect_inner().await;
         match &result {
+            Ok(()) if self.relaunch => tracing::info!("restarting as administrator"),
             Ok(()) => tracing::info!("connected"),
             Err(e) => tracing::error!("connect failed: {e:#}"),
         }
@@ -486,23 +510,55 @@ impl Core {
                 if !TUN_AVAILABLE {
                     bail!("TUN mode is not available on this system yet; switch to Proxy mode");
                 }
-                let helper = helper_binary()?;
-                let shipped = helper.clone();
-                if !tokio::task::spawn_blocking(move || veil_helper::is_current(&shipped)).await? {
-                    tracing::info!("installing helper from {}", helper.display());
-                    tokio::task::spawn_blocking(move || veil_helper::install(&helper))
-                        .await?
-                        .context("could not install the helper")?;
+                // Windows: the engine runs inside this (elevated) process. The system proxy
+                // stays off in TUN mode, as on macOS.
+                #[cfg(windows)]
+                {
+                    use veil_engine::tun::{TunOptions, TunRoutes};
+                    // Check first, so nobody sees a UAC prompt for a setup that cannot work.
+                    win::check_wintun()?;
+                    if !win::is_elevated() {
+                        if self.no_relaunch {
+                            bail!("TUN mode needs administrator rights; start Veil as administrator");
+                        }
+                        win::relaunch_elevated()?;
+                        self.relaunch = true;
+                        return Ok(());
+                    }
+                    let engine = Engine::start(EngineConfig {
+                        listen: SocketAddr::from(([127, 0, 0, 1], port)),
+                        server: profile.server,
+                        routing,
+                        geo_dir: self.store.dir().to_path_buf(),
+                        tun: Some(TunOptions {
+                            mtu: 1500,
+                            dns_backup: self.store.dir().join("dns-backup.json"),
+                            routes: TunRoutes::All,
+                        }),
+                    })
+                    .await?;
+                    self.conn = Some(Conn::Proxy { engine: Box::new(engine), sysproxy: false });
                 }
-                let req = veil_helper::Request::Start {
-                    server: Box::new(profile.server),
-                    routing,
-                    geo_dir: self.store.dir().to_path_buf(),
-                    mixed_port: port,
-                    routes: veil_helper::TunRoutes::All,
-                };
-                tokio::task::spawn_blocking(move || veil_helper::call(&req)).await??;
-                self.conn = Some(Conn::Tun);
+                #[cfg(not(windows))]
+                {
+                    let helper = helper_binary()?;
+                    let shipped = helper.clone();
+                    if !tokio::task::spawn_blocking(move || veil_helper::is_current(&shipped)).await? {
+                        tracing::info!("installing helper from {}", helper.display());
+                        tokio::task::spawn_blocking(move || veil_helper::install(&helper))
+                            .await?
+                            .context("could not install the helper")?;
+                    }
+                    let req = veil_helper::Request::Start {
+                        server: Box::new(profile.server),
+                        routing,
+                        geo_dir: self.store.dir().to_path_buf(),
+                        mixed_port: port,
+                        routes: veil_helper::TunRoutes::All,
+                    };
+                    tokio::task::spawn_blocking(move || veil_helper::call(&req)).await??;
+                    self.conn = Some(Conn::Tun);
+                }
             }
         }
         self.connected_at = Some(Instant::now());
@@ -599,9 +655,81 @@ fn skipped_note(skipped: usize) -> String {
     }
 }
 
-const TUN_AVAILABLE: bool = cfg!(target_os = "macos");
+const TUN_AVAILABLE: bool = cfg!(any(target_os = "macos", windows));
+
+/// Windows: elevation check, UAC restart and the wintun.dll check.
+#[cfg(windows)]
+mod win {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::null_mut;
+
+    use anyhow::{Context, Result, bail};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    /// Whether this process runs with an elevated (administrator) token.
+    pub fn is_elevated() -> bool {
+        unsafe {
+            let mut token: HANDLE = null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return false;
+            }
+            let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+            let mut returned = 0u32;
+            let ok = GetTokenInformation(
+                token,
+                TokenElevation,
+                (&raw mut elevation).cast(),
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut returned,
+            );
+            CloseHandle(token);
+            ok != 0 && elevation.TokenIsElevated != 0
+        }
+    }
+
+    /// Starts this exe again through the UAC prompt, asking it to connect in TUN mode.
+    pub fn relaunch_elevated() -> Result<()> {
+        let exe = std::env::current_exe().context("cannot find Veil.exe")?;
+        let wide = |s: &std::ffi::OsStr| s.encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let verb = wide(std::ffi::OsStr::new("runas"));
+        let file = wide(exe.as_os_str());
+        let args = wide(std::ffi::OsStr::new(super::CONNECT_TUN_ARG));
+        let code = unsafe {
+            ShellExecuteW(null_mut(), verb.as_ptr(), file.as_ptr(), args.as_ptr(), std::ptr::null(), SW_SHOWNORMAL)
+        } as isize;
+        match code {
+            c if c > 32 => Ok(()),
+            // SE_ERR_ACCESSDENIED: the UAC prompt was declined.
+            5 => bail!("Administrator permission was declined"),
+            c => bail!("could not restart Veil as administrator (error {c})"),
+        }
+    }
+
+    /// tun-rs loads wintun.dll from the folder of the exe.
+    pub fn check_wintun() -> Result<()> {
+        let exe = std::env::current_exe()?;
+        if exe.parent().is_some_and(|d| d.join("wintun.dll").is_file()) {
+            Ok(())
+        } else {
+            bail!("wintun.dll not found next to Veil.exe")
+        }
+    }
+}
+
+/// Command-line flag of the elevated copy: connect in TUN mode as soon as the UI is up.
+pub const CONNECT_TUN_ARG: &str = "--connect-tun";
+
+/// Whether the command line (without the program name) asks for `--connect-tun`.
+pub fn wants_connect_tun<I: IntoIterator<Item = String>>(args: I) -> bool {
+    args.into_iter().any(|a| a == CONNECT_TUN_ARG)
+}
 
 /// The helper ships next to the app binary (Contents/MacOS in the bundle).
+#[cfg(not(windows))]
 fn helper_binary() -> Result<PathBuf> {
     let exe = std::env::current_exe()?;
     let dir = exe.parent().context("no exe dir")?;
@@ -616,6 +744,23 @@ fn helper_binary() -> Result<PathBuf> {
         }
     }
     bail!("veil-helper not found next to {}", exe.display())
+}
+
+#[cfg(test)]
+mod arg_tests {
+    use super::wants_connect_tun;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn connect_tun_flag() {
+        assert!(wants_connect_tun(args(&["--connect-tun"])));
+        assert!(wants_connect_tun(args(&["--x", "--connect-tun"])));
+        assert!(!wants_connect_tun(args(&[])));
+        assert!(!wants_connect_tun(args(&["--connect-tunnel", "connect-tun"])));
+    }
 }
 
 #[cfg(test)]

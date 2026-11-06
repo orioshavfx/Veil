@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
 use ipstack::{IpStack, IpStackConfig, IpStackStream, IpStackUdpStream};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::task::JoinHandle;
@@ -67,8 +67,8 @@ fn interface_index(name: &str) -> Result<NonZeroU32> {
 }
 
 #[cfg(windows)]
-fn interface_index(_name: &str) -> Result<NonZeroU32> {
-    bail!("finding the physical interface is not supported on Windows yet")
+fn interface_index(name: &str) -> Result<NonZeroU32> {
+    veil_sysproxy::interface_index(name)
 }
 
 #[derive(Debug, Clone)]
@@ -165,15 +165,11 @@ pub(crate) struct Tun {
 }
 
 impl Tun {
-    // On Windows only the "not supported yet" branch is live until stage W2.
-    #[cfg_attr(windows, allow(unused_variables, unreachable_code))]
     pub(crate) async fn start(shared: Arc<Shared>, opts: TunOptions, server: &ServerConfig) -> Result<Self> {
         #[cfg(unix)]
         if unsafe { libc::geteuid() } != 0 {
-            bail!("TUN mode needs root: run with sudo");
+            anyhow::bail!("TUN mode needs root: run with sudo");
         }
-        #[cfg(windows)]
-        bail!("TUN mode is not supported on Windows yet");
         // Undo leftovers of a run that crashed before touching anything else.
         veil_sysproxy::dns_restore(&opts.dns_backup)?;
 
@@ -200,7 +196,7 @@ impl Tun {
             .ipv6(TUN_ADDR6, 64)
             .mtu(opts.mtu)
             .build_async()
-            .context("cannot create utun device")?;
+            .context("cannot create TUN device (on Windows: run as administrator, wintun.dll next to the exe)")?;
         let name = dev.name()?;
         // Keep our own sockets (pinned to the physical interface) routable once
         // the split routes send everything else into the tunnel.
