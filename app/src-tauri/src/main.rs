@@ -371,7 +371,45 @@ mod session_end {
     }
 }
 
+/// Only one Veil per user session: a second launch brings the first window forward and exits,
+/// instead of adding a second tray icon that fights over the system proxy.
+#[cfg(windows)]
+mod single_instance {
+    use std::ptr::null_mut;
+
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow};
+
+    /// Returns false when another Veil is already running.
+    pub fn acquire() -> bool {
+        let name: Vec<u16> = "Local\\dev.veil.app.single-instance".encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            let handle = CreateMutexW(null_mut(), 0, name.as_ptr());
+            if handle.is_null() {
+                return true; // cannot tell: better two windows than none
+            }
+            // The handle is kept open for the life of the process on purpose.
+            if GetLastError() != ERROR_ALREADY_EXISTS {
+                return true;
+            }
+            let title: Vec<u16> = "Veil".encode_utf16().chain(std::iter::once(0)).collect();
+            let hwnd = FindWindowW(null_mut(), title.as_ptr());
+            if !hwnd.is_null() {
+                ShowWindow(hwnd, SW_SHOW);
+                ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+            }
+            false
+        }
+    }
+}
+
 fn main() {
+    #[cfg(windows)]
+    if !single_instance::acquire() {
+        return;
+    }
     init_logging();
     #[cfg(windows)]
     session_end::start();

@@ -6,17 +6,19 @@ let state = null;
 let busy = false;
 let busyLabel = null; // status text while a connection action runs
 let last = null; // previous traffic sample, for speed
+let showSpeed = true; // speed readout on/off (remembered per device)
+try { showSpeed = localStorage.getItem('veil.speed') !== '0'; } catch {}
 
 const SECURITY = { reality: 'REALITY', tls: 'TLS' };
 const MODE_NAMES = { proxy: 'Proxy', tun: 'TUN' };
 const MODE_DESC = {
   macos: {
-    proxy: 'Veil turns on the macOS system proxy. Browsers and apps that respect the system proxy settings go through it. No password needed.',
-    tun: 'All system traffic goes through Veil, including apps that ignore proxy settings. Required for app rules. macOS asks for an administrator password the first time.',
+    proxy: 'Uses the macOS system proxy. No password needed.',
+    tun: 'Routes all system traffic, including apps that ignore the proxy. Asks for an administrator password the first time.',
   },
   windows: {
-    proxy: 'Veil turns on the Windows system proxy. Browsers and most apps go through it; some programs (games, curl, git, Store apps) ignore it. No administrator rights needed.',
-    tun: 'TUN mode for Windows is coming in a later version. Use Proxy mode for now.',
+    proxy: 'Uses the Windows system proxy. No administrator rights needed.',
+    tun: 'TUN for Windows is not available yet. Use Proxy.',
   },
 };
 const ROUTING_DESC = {
@@ -138,7 +140,7 @@ function render() {
   const presetName = (s.presets.find(([n]) => n === s.preset) || [])[1] || '';
   $('caption').textContent = `${MODE_NAMES[s.mode]} · ${presetName}`;
   if (!s.connected) {
-    $('up').textContent = $('down').textContent = '0 B/s';
+    $('up').textContent = $('down').textContent = showSpeed ? '0 B/s' : '';
     $('timer').textContent = clock(0);
   }
   renderGroups();
@@ -459,12 +461,26 @@ $('rule-form').onsubmit = async (e) => {
 
 // ---- traffic ---------------------------------------------------------------
 
+function applySpeedToggle() {
+  $('speed-toggle').setAttribute('aria-pressed', String(showSpeed));
+  $('speed-toggle').textContent = showSpeed ? 'Speed: on' : 'Speed: off';
+  document.querySelector('.meters').classList.toggle('no-speed', !showSpeed);
+  if (!showSpeed) $('up').textContent = $('down').textContent = '';
+  else $('up').textContent = $('down').textContent = '0 B/s';
+  last = null;
+}
+$('speed-toggle').onclick = () => {
+  showSpeed = !showSpeed;
+  try { localStorage.setItem('veil.speed', showSpeed ? '1' : '0'); } catch {}
+  applySpeedToggle();
+};
+
 async function tick() {
   if (!state?.connected) { last = null; return; }
   const t = await invoke('traffic');
   if (!t.connected) { reload(); return; }
   const now = performance.now();
-  if (last) {
+  if (showSpeed && last) {
     const dt = (now - last.at) / 1000;
     $('up').textContent = `${bytes(Math.max(0, t.upload - last.upload) / dt)}/s`;
     $('down').textContent = `${bytes(Math.max(0, t.download - last.download) / dt)}/s`;
@@ -474,6 +490,7 @@ async function tick() {
 }
 
 setRuleKind('site');
+applySpeedToggle();
 listen('state-changed', reload);
 setInterval(tick, 1000);
 reload();

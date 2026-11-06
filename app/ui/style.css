@@ -239,3 +239,5 @@ body.busy #groups { opacity: .6; }
   font-size: 0.78em; font-weight: 700; line-height: 1.35; letter-spacing: 0.02em;
   vertical-align: 0.06em; font-family: system-ui, "Segoe UI", sans-serif;
 }
+
+.meters.no-speed .arrow { visibility: hidden; }

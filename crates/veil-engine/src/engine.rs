@@ -80,6 +80,7 @@ impl Shared {
         };
         if !first.is_empty() {
             remote.write_all(first).await?;
+            self.stats.upload.fetch_add(first.len() as u64, Ordering::Relaxed);
         } else {
             // Protocol headers ride along with the client's first bytes. If the client
             // is silent (server-speaks-first protocols), send the header on its own.
@@ -95,12 +96,56 @@ impl Shared {
         }
         remote.flush().await?;
         self.stats.active.fetch_add(1, Ordering::Relaxed);
-        let result = copy_bidirectional(&mut inbound, &mut remote).await;
+        // Bytes are counted as they move, so the speed readout updates continuously
+        // instead of once when a connection closes.
+        let mut counted = Counted { inner: remote, stats: &self.stats };
+        let result = copy_bidirectional(&mut inbound, &mut counted).await;
         self.stats.active.fetch_sub(1, Ordering::Relaxed);
-        let (up, down) = result?;
-        self.stats.upload.fetch_add(up + first.len() as u64, Ordering::Relaxed);
-        self.stats.download.fetch_add(down, Ordering::Relaxed);
-        Ok(())
+        result.map(|_| ())
+    }
+}
+
+/// Counts bytes passing through a stream: writes are upload, reads are download.
+struct Counted<'a, R> {
+    inner: R,
+    stats: &'a Stats,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for Counted<'_, R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &poll {
+            let n = buf.filled().len() - before;
+            self.stats.download.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        poll
+    }
+}
+
+impl<R: AsyncWrite + Unpin> AsyncWrite for Counted<'_, R> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_write(cx, data);
+        if let std::task::Poll::Ready(Ok(n)) = &poll {
+            self.stats.upload.fetch_add(*n as u64, Ordering::Relaxed);
+        }
+        poll
+    }
+
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
