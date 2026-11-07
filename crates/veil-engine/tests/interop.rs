@@ -328,3 +328,52 @@ async fn hysteria2() {
     let err = tokio::time::timeout(Duration::from_secs(15), client.probe()).await.expect("no hang").unwrap_err();
     assert!(err.to_string().contains("pinSHA256"), "{err}");
 }
+
+/// Hysteria 2 with Salamander obfuscation (`finalmask.udp`). Skipped when this Xray build does
+/// not accept the finalmask setting.
+#[tokio::test]
+async fn hysteria2_salamander() {
+    skip_without_xray!();
+    let port = free_port();
+    let tls = tls_settings();
+    let inbound = json!({
+        "listen": "127.0.0.1", "port": port, "protocol": "hysteria",
+        "settings": { "version": 2, "clients": [{ "auth": "secret" }] },
+        "streamSettings": { "network": "hysteria", "hysteriaSettings": { "version": 2 },
+            "security": "tls", "tlsSettings": { "alpn": ["h3"], "certificates": tls["certificates"] },
+            "finalmask": { "udp": [{ "type": "salamander", "settings": { "password": "pw-salamander" } }] } },
+    });
+    // `xray run -test` validates the config without starting it.
+    let dir = std::env::temp_dir().join(format!("veil-xray-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("config.json");
+    std::fs::write(&cfg, serde_json::to_vec(&json!({ "inbounds": [inbound.clone()], "outbounds": [{ "protocol": "freedom" }] })).unwrap()).unwrap();
+    let accepted = Command::new("xray").args(["run", "-test", "-c"]).arg(&cfg).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+    let _ = std::fs::remove_dir_all(&dir);
+    if !accepted {
+        eprintln!("this xray does not accept finalmask/salamander, skipping");
+        return;
+    }
+    let _x = start_xray(inbound).await;
+    let link = format!("hysteria2://secret@127.0.0.1:{port}/?sni=localhost&insecure=1&obfs=salamander&obfs-password=pw-salamander");
+    let ready = veil_proto::hysteria::HysteriaClient::new(&veil_config::parse_link(&link).unwrap().server).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), ready.probe()).await {
+            Ok(Ok(_)) => break,
+            other => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "salamander server not ready within 10s, last probe result: {:?}",
+                    other.map(|r| r.map(|_| ()).map_err(|e| e.to_string()))
+                );
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+    roundtrip(&link).await;
+    // Wrong obfs password: the server drops everything, the handshake must time out, not hang.
+    let wrong = veil_config::parse_link(&link.replace("pw-salamander", "nope")).unwrap();
+    let client = veil_proto::hysteria::HysteriaClient::new(&wrong.server).unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(25), client.probe()).await.expect("no hang").is_err());
+}

@@ -14,7 +14,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use veil_config::{Protocol, Security, ServerConfig};
 
-use crate::{Address, BoxStream, dial, tls};
+use crate::{Address, BoxStream, dial, salamander, tls};
 
 const TCP_REQUEST: u64 = 0x401;
 /// HTTP status the server answers a successful /auth with.
@@ -119,6 +119,8 @@ pub struct HysteriaClient {
     auth: String,
     sni: String,
     quic: quinn::ClientConfig,
+    /// Salamander obfuscation of every UDP datagram, if the server uses it.
+    obfs: Option<salamander::Salamander>,
     session: Mutex<Option<Session>>,
     /// Interface pinning for this client only (pings bypassing other VPNs).
     pin: Option<dial::Bypass>,
@@ -129,9 +131,6 @@ impl HysteriaClient {
         let Protocol::Hysteria2 { auth, obfs_password } = &server.protocol else {
             return Err(err("not a hysteria2 server"));
         };
-        if obfs_password.is_some() {
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "hysteria2 salamander obfuscation is not supported yet"));
-        }
         let (sni, insecure, pins) = match &server.security {
             Security::Tls(t) => (t.sni.clone().unwrap_or_else(|| server.address.clone()), t.insecure, t.pin_sha256.as_slice()),
             _ => (server.address.clone(), false, &[][..]),
@@ -160,9 +159,12 @@ impl HysteriaClient {
         // Windows sets the don't-fragment bit on every datagram; an MTU probe above the real
         // path/interface MTU (VPN, PPPoE, Wi-Fi) fails locally there (WSAEMSGSIZE) instead of
         // being silently dropped. Hysteria2 TCP proxying needs no big packets, so cap probes.
-        if cfg!(windows) {
+        // Salamander adds 8 bytes to every datagram, so probe 8 bytes lower to keep the wire size.
+        let obfs_password = obfs_password.as_deref().filter(|p| !p.is_empty());
+        if cfg!(windows) || obfs_password.is_some() {
             let mut mtu = quinn::MtuDiscoveryConfig::default();
-            mtu.upper_bound(1350);
+            let upper: u16 = if cfg!(windows) { 1350 } else { 1452 };
+            mtu.upper_bound(if obfs_password.is_some() { upper - salamander::OVERHEAD as u16 } else { upper });
             transport.mtu_discovery_config(Some(mtu));
         }
         quic.transport_config(Arc::new(transport));
@@ -172,6 +174,7 @@ impl HysteriaClient {
             auth: auth.clone(),
             sni,
             quic,
+            obfs: obfs_password.map(salamander::Salamander::new),
             session: Mutex::new(None),
             pin: None,
         })
@@ -195,13 +198,23 @@ impl HysteriaClient {
         .and_then(|s| s.into_std())
         .map_err(|e| stage("bind (UDP socket)", addr, e))?;
         let local = socket.local_addr().map(|a| a.to_string()).unwrap_or_default();
-        let mut endpoint = quinn::Endpoint::new(
-            quinn::EndpointConfig::default(),
-            None,
-            socket,
-            Arc::new(quinn::TokioRuntime),
-        )
-        .map_err(|e| stage("bind (QUIC endpoint)", format!("{local} -> {addr}"), e))?;
+        let endpoint = match &self.obfs {
+            None => quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, Arc::new(quinn::TokioRuntime)),
+            Some(sal) => {
+                tracing::info!("hysteria: salamander obfuscation on");
+                use quinn::Runtime as _;
+                quinn::TokioRuntime.wrap_udp_socket(socket).and_then(|inner| {
+                    let wrapped = salamander::SalamanderSocket::new(inner, sal.clone());
+                    quinn::Endpoint::new_with_abstract_socket(
+                        quinn::EndpointConfig::default(),
+                        None,
+                        Arc::new(wrapped),
+                        Arc::new(quinn::TokioRuntime),
+                    )
+                })
+            }
+        };
+        let mut endpoint = endpoint.map_err(|e| stage("bind (QUIC endpoint)", format!("{local} -> {addr}"), e))?;
         endpoint.set_default_client_config(self.quic.clone());
         let conn = tokio::time::timeout(dial::CONNECT_TIMEOUT, endpoint.connect(addr, &self.sni).map_err(|e| err(format!("handshake [{local} -> {addr}]: {e}")))?)
             .await

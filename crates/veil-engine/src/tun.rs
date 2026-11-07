@@ -219,7 +219,10 @@ impl Tun {
         tracing::info!("TUN {name} up ({:?})", opts.routes);
 
         let mut cfg = IpStackConfig::default();
-        cfg.mtu(opts.mtu).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        if let Err(e) = cfg.mtu(opts.mtu) {
+            undo(&name);
+            return Err(anyhow::anyhow!("{e:?}"));
+        }
         cfg.udp_timeout(UDP_IDLE);
         // The default 60 s idle timeout kills quiet HTTP/2 and websocket connections.
         let mut tcp = ipstack::TcpConfig::default();

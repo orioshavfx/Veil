@@ -25,3 +25,5 @@ veil-build-windows.flag
 veil-build-windows.log
 veil-build-windows.log.tmp
 veil-watch.command
+veil-build-mac.command
+veil-build-mac.log

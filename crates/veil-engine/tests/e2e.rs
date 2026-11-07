@@ -306,10 +306,12 @@ async fn implicit_direct_falls_back_to_proxy() {
     };
     // A closed local port refuses direct connections, like a censored site. It
     // avoids DNS, which a VPN running on the test machine may answer for any name.
-    let blocked: SocketAddr = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap()
-    };
+    // The port is held by a bound, non-listening socket until the test ends: a freed
+    // port could be taken by a parallel test, and then the "direct" connection would
+    // succeed and the fallback to the VPN would never happen.
+    let blocked_guard = tokio::net::TcpSocket::new_v4().unwrap();
+    blocked_guard.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let blocked: SocketAddr = blocked_guard.local_addr().unwrap();
 
     let engine = start_with(Vec::new()).await.unwrap();
     let mut s = via_socks5(engine.local_addr(), blocked).await;

@@ -70,7 +70,7 @@ pub fn validate_alias(name: &str) -> Result<()> {
     if name.is_empty() || name.chars().count() > 256 {
         bail!("invalid interface name length");
     }
-    if let Some(c) = name.chars().find(|c| !(c.is_alphanumeric() || " -_.()#:".contains(*c))) {
+    if let Some(c) = name.chars().find(|c| !(c.is_alphanumeric() || " -_.()#:*&+,/".contains(*c))) {
         bail!("interface name {name:?} contains unsupported character {c:?}");
     }
     Ok(())
@@ -145,6 +145,7 @@ pub fn add_host_route_script(ip: IpAddr, gateway: IpAddr) -> String {
          $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Where-Object {{ $_.NextHop -eq '{gateway}' }} | \
          Sort-Object RouteMetric | Select-Object -First 1; \
          if (-not $r) {{ throw 'no default route via {gateway}' }}; \
+         Remove-NetRoute -DestinationPrefix '{ip}/32' -PolicyStore ActiveStore -Confirm:$false -ErrorAction SilentlyContinue; \
          New-NetRoute -DestinationPrefix '{ip}/32' -InterfaceIndex $r.InterfaceIndex -NextHop '{gateway}' -RouteMetric 1 -PolicyStore ActiveStore | Out-Null"
     )
 }

@@ -12,6 +12,49 @@ pub struct Parsed {
     pub skipped: Vec<String>,
 }
 
+/// Salamander password from `finalmask.udp` / `udpmasks` of a hysteria stream. Everything
+/// else is ignored with a warning naming only keys and types, never secrets.
+fn hysteria_obfs(stream: &Value) -> Option<String> {
+    fn entry(origin: &str, e: &Value, found: &mut Option<String>) {
+        let ty = e.get("type").and_then(Value::as_str).unwrap_or("?");
+        if ty != "salamander" {
+            tracing::warn!("hysteria2: mask {origin} type {ty} is not supported, ignored");
+            return;
+        }
+        match e.pointer("/settings/password").and_then(Value::as_str).filter(|p| !p.is_empty()) {
+            None => tracing::warn!("hysteria2: salamander mask {origin} has no password, ignored"),
+            Some(_) if found.is_some() => tracing::warn!("hysteria2: extra salamander mask {origin} ignored"),
+            Some(p) => *found = Some(p.to_string()),
+        }
+    }
+    let mut found = None;
+    for key in ["finalmask", "udpmasks"] {
+        match stream.get(key) {
+            None | Some(Value::Null) => {}
+            Some(Value::Object(m)) => {
+                for (list, v) in m {
+                    let origin = format!("{key}.{list}");
+                    match v {
+                        Value::Array(a) if list == "udp" => a.iter().for_each(|e| entry(&origin, e, &mut found)),
+                        Value::Array(a) => {
+                            if !a.is_empty() {
+                                tracing::warn!("hysteria2: mask list {origin} is not supported, ignored");
+                            }
+                        }
+                        Value::Null => {}
+                        Value::Object(o) if o.is_empty() => {}
+                        _ => tracing::warn!("hysteria2: mask setting {origin} is not supported, ignored"),
+                    }
+                }
+            }
+            Some(Value::Array(a)) => a.iter().for_each(|e| entry(key, e, &mut found)),
+            Some(Value::String(s)) if s.is_empty() => {}
+            Some(_) => tracing::warn!("hysteria2: unrecognised {key} structure, ignored"),
+        }
+    }
+    found
+}
+
 pub fn looks_like_json(body: &str) -> bool {
     matches!(body.trim_start().as_bytes().first(), Some(b'[' | b'{'))
 }
@@ -120,19 +163,9 @@ fn outbound(o: &Value) -> Result<ServerConfig, String> {
             if version.is_some_and(|v| v != 2) {
                 return Err("only Hysteria version 2 is supported".into());
             }
-            // Obfuscation (e.g. salamander) is declared as UDP masks in the stream
-            // settings. The client cannot do it, so skip instead of importing a
-            // profile that would silently connect without obfs.
-            let masked = |k: &str| match stream.get(k) {
-                None | Some(Value::Null) => false,
-                Some(Value::Array(a)) => !a.is_empty(),
-                Some(Value::Object(m)) => !m.is_empty(),
-                Some(Value::String(s)) => !s.is_empty(),
-                Some(_) => true,
-            };
-            if masked("finalmask") || masked("udpmasks") {
-                return Err("hysteria2 obfuscation (finalmask) is not supported yet".into());
-            }
+            // Salamander obfuscation is declared as a UDP mask in the stream settings.
+            // Any other mask is ignored (with a warning), the profile is still imported.
+            let obfs_password = hysteria_obfs(&stream);
             let auth = str_at(&stream, &["hysteriaSettings", "auth"])
                 .or(str_at(user, &["password"]))
                 .ok_or("hysteria without auth")?
@@ -141,7 +174,7 @@ fn outbound(o: &Value) -> Result<ServerConfig, String> {
             return Ok(ServerConfig {
                 address,
                 port,
-                protocol: Protocol::Hysteria2 { auth, obfs_password: None },
+                protocol: Protocol::Hysteria2 { auth, obfs_password },
                 transport: Transport::Tcp,
                 security: Security::Tls(TlsConfig {
                     sni: str_at(&t, &["serverName"]).filter(|s| !s.is_empty()).map(str::to_string),
@@ -271,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn hysteria_with_finalmask_is_skipped() {
+    fn hysteria_finalmask() {
         let make = |extra: &str| {
             format!(
                 r#"{{"remarks": "Hy", "outbounds": [{{"protocol": "hysteria",
@@ -280,17 +313,30 @@ mod tests {
                     "security": "tls", "tlsSettings": {{"serverName": "g.example.com"}}{extra}}}}}]}}"#
             )
         };
-        let plain = parse(&make("")).unwrap();
-        assert_eq!(plain.profiles.len(), 1);
-        assert!(plain.skipped.is_empty(), "{:?}", plain.skipped);
-
-        let masked = parse(&make(r#", "finalmask": {"udp": [{"type": "salamander", "settings": {"password": "pw"}}]}"#)).unwrap();
-        assert!(masked.profiles.is_empty());
-        assert_eq!(masked.skipped.len(), 1);
-        assert!(masked.skipped[0].contains("obfuscation"), "{:?}", masked.skipped);
-
-        let empty = parse(&make(r#", "finalmask": {}"#)).unwrap();
-        assert_eq!(empty.profiles.len(), 1);
+        let obfs = |extra: &str| {
+            let p = parse(&make(extra)).unwrap();
+            assert_eq!(p.profiles.len(), 1, "{extra}");
+            assert!(p.skipped.is_empty(), "{:?}", p.skipped);
+            match &p.profiles[0].server.protocol {
+                Protocol::Hysteria2 { obfs_password, .. } => obfs_password.clone(),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(obfs(""), None);
+        assert_eq!(obfs(r#", "finalmask": {}"#), None);
+        assert_eq!(obfs(r#", "finalmask": {"udp": []}"#), None);
+        assert_eq!(obfs(r#", "finalmask": {"udp": [{"type": "salamander", "settings": {"password": "pw"}}]}"#), Some("pw".into()));
+        // Other masks and malformed ones are ignored, not rejected.
+        assert_eq!(obfs(r#", "finalmask": {"udp": [{"type": "header-dns"}]}"#), None);
+        assert_eq!(obfs(r#", "finalmask": {"udp": [{"type": "salamander", "settings": {"password": ""}}]}"#), None);
+        assert_eq!(obfs(r#", "finalmask": {"tcp": [{"type": "fragment"}], "quicParams": {"congestion": "bbr"}}"#), None);
+        assert_eq!(obfs(r#", "udpmasks": [{"type": "xxx"}]"#), None);
+        assert_eq!(obfs(r#", "finalmask": "weird""#), None);
+        // Salamander next to other masks: salamander wins.
+        assert_eq!(
+            obfs(r#", "finalmask": {"udp": [{"type": "header-dns"}, {"type": "salamander", "settings": {"password": "pw2"}}], "tcp": [{"type": "x"}]}"#),
+            Some("pw2".into())
+        );
     }
 
     #[test]

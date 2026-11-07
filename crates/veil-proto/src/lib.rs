@@ -1,12 +1,14 @@
 //! Outbound proxy protocols and transports.
 
 pub mod address;
+pub mod blake2b;
 pub mod crypto;
 pub mod dial;
 pub mod dns;
 pub mod hysteria;
 pub mod outbound;
 pub mod reality;
+pub mod salamander;
 pub mod shadowsocks;
 pub mod stream;
 pub mod tls;

@@ -213,11 +213,10 @@ fn parse_hysteria2(link: &str) -> Result<Profile, LinkError> {
     let obfs_password = match q.get("obfs").map(String::as_str) {
         None | Some("" | "none") => None,
         Some("salamander") => {
-            if non_empty(q, "obfs-password").is_none() {
-                return Err(invalid("salamander obfs requires obfs-password"));
+            match non_empty(q, "obfs-password") {
+                Some(pw) => Some(pw),
+                None => return Err(invalid("salamander obfs requires obfs-password")),
             }
-            // HysteriaClient::new rejects any obfuscation (Unsupported) for now.
-            return Err(invalid("salamander obfs is not supported yet"));
         }
         Some(other) => return Err(invalid(format!("unsupported obfs {other}"))),
     };
@@ -588,9 +587,13 @@ mod tests {
         assert_eq!((t.sni.as_deref(), t.insecure), (Some("real.example.com"), true));
         let p2 = parse_link("hy2://user:pass@1.2.3.4:443?sni=x.example").unwrap();
         assert_eq!(p2.server.protocol, Protocol::Hysteria2 { auth: "user:pass".into(), obfs_password: None });
-        // Unsupported features must be rejected at import, not silently dropped.
-        assert!(parse_link("hy2://user:pass@1.2.3.4:443?obfs=salamander&obfs-password=x").is_err());
+        // Salamander obfuscation: accepted with a password, round-trips; without one it is an error.
+        let ob = parse_link("hy2://user:pass@1.2.3.4:443?obfs=salamander&obfs-password=x").unwrap();
+        assert_eq!(ob.server.protocol, Protocol::Hysteria2 { auth: "user:pass".into(), obfs_password: Some("x".into()) });
+        let again = parse_link(&to_link(&ob)).unwrap();
+        assert_eq!(again.server.protocol, ob.server.protocol);
         assert!(parse_link("hy2://user:pass@1.2.3.4:443?obfs=salamander").is_err());
+        assert!(parse_link("hy2://user:pass@1.2.3.4:443?obfs=other&obfs-password=x").is_err());
         // Certificate pin: accepted in any case / separator style, normalised, round-trips.
         let hex = "0123456789ABCDEF".repeat(4);
         let want = hex.to_lowercase();
