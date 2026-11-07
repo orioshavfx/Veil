@@ -1,6 +1,9 @@
 //! Root daemon that runs the engine in TUN mode on behalf of one user.
 
+use std::ffi::{CString, OsStr};
+use std::fs::File;
 use std::net::SocketAddr;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
@@ -54,6 +57,54 @@ fn home_dir_of(uid: u32) -> Option<PathBuf> {
     Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
 }
 
+fn cstring(name: &OsStr) -> std::io::Result<CString> {
+    use std::os::unix::ffi::OsStrExt;
+    CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "name contains NUL"))
+}
+
+/// `openat(2)` returning an owned `File` (also used for directories); retries on EINTR.
+fn openat_fd(dir: RawFd, name: &OsStr, flags: libc::c_int, mode: libc::mode_t) -> std::io::Result<File> {
+    let c = cstring(name)?;
+    loop {
+        let fd = unsafe { libc::openat(dir, c.as_ptr(), flags, libc::c_uint::from(mode)) };
+        if fd >= 0 {
+            return Ok(unsafe { File::from_raw_fd(fd) });
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+const DIR_FLAGS: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+/// Walk an absolute, normalized path from "/" one component at a time with
+/// `openat(O_DIRECTORY|O_NOFOLLOW)`. Any symlink on the way (including the last
+/// component) is an error, so the returned descriptor refers to exactly the directory
+/// named by the path, whatever other processes do to the tree afterwards.
+fn open_dir_nofollow(path: &Path) -> Result<File> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        bail!("{} is not an absolute path", path.display());
+    }
+    let mut cur = openat_fd(libc::AT_FDCWD, OsStr::new("/"), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC, 0)
+        .context("cannot open /")?;
+    for comp in path.components() {
+        match comp {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                cur = openat_fd(cur.as_raw_fd(), name, DIR_FLAGS, 0).with_context(|| {
+                    format!("cannot open {} (symlink or not a directory at {:?})", path.display(), name)
+                })?;
+            }
+            _ => bail!("{} is not a normalized path", path.display()),
+        }
+    }
+    Ok(cur)
+}
+
 /// The client chooses where root reads geoip/geosite from, so accept only a
 /// canonical directory owned by that client inside its home directory.
 fn check_geo_dir(dir: &Path, uid: u32) -> Result<PathBuf> {
@@ -69,37 +120,62 @@ fn check_geo_dir(dir: &Path, uid: u32) -> Result<PathBuf> {
     if home.parent().is_none() || !canon.starts_with(&home) {
         bail!("geo dir {} is outside the client's home directory", canon.display());
     }
-    let meta = std::fs::metadata(&canon)?;
+    // Re-walk the canonical path without following links and fstat the descriptor.
+    let fd = open_dir_nofollow(&canon)?;
+    let meta = fd.metadata()?;
     if !meta.is_dir() || meta.uid() != uid {
         bail!("geo dir {} is not owned by the client", canon.display());
     }
     Ok(canon)
 }
 
+/// Create (if needed) and verify `name` inside the open directory `parent`: a real
+/// directory (never a symlink), owned by `owner`, mode 0700. All steps go through
+/// descriptors (mkdirat/openat/fstat/fchmod), nothing is looked up by path twice.
+fn private_dir_at(parent: &File, name: &OsStr, owner: u32) -> Result<File> {
+    use std::os::unix::fs::MetadataExt;
+    let c = cstring(name)?;
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), c.as_ptr(), 0o700) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(e).with_context(|| format!("cannot create {name:?}"));
+        }
+    }
+    let dir = openat_fd(parent.as_raw_fd(), name, DIR_FLAGS, 0)
+        .with_context(|| format!("{name:?} is not a regular directory"))?;
+    let meta = dir.metadata()?;
+    if !meta.is_dir() {
+        bail!("{name:?} is not a regular directory");
+    }
+    if meta.uid() != owner {
+        bail!("{name:?} has unexpected owner {}", meta.uid());
+    }
+    if meta.mode() & 0o7777 != 0o700 {
+        dir.set_permissions(std::fs::Permissions::from_mode(0o700))?; // fchmod
+    }
+    Ok(dir)
+}
+
+/// `dir` must be absolute and canonical (no symlinks); its parent is walked with
+/// O_NOFOLLOW from "/" and the last component is handled relative to that descriptor.
+fn ensure_private_dir_canonical(dir: &Path, owner: u32) -> Result<File> {
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
+        bail!("{} has no parent directory", dir.display());
+    };
+    let parent_fd = open_dir_nofollow(parent)?;
+    private_dir_at(&parent_fd, name, owner)
+}
+
 /// Create (if needed) and verify a root-only directory: a real directory (never a
 /// symlink), owned by `owner`, mode 0700.
 fn ensure_private_dir(dir: &Path, owner: u32) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-    if let Some(parent) = dir.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e.into()),
-    }
-    // Never follow a symlink planted at the path: inspect the entry itself.
-    let meta = std::fs::symlink_metadata(dir)?;
-    if !meta.file_type().is_dir() {
-        bail!("{} is not a regular directory", dir.display());
-    }
-    if meta.uid() != owner {
-        bail!("{} has unexpected owner {}", dir.display(), meta.uid());
-    }
-    if meta.mode() & 0o7777 != 0o700 {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
+        bail!("{} has no parent directory", dir.display());
+    };
+    std::fs::create_dir_all(parent)?;
+    // Canonicalize once, then re-walk that path without following links.
+    let canon = parent.canonicalize()?.join(name);
+    ensure_private_dir_canonical(&canon, owner).map(|_| ())
 }
 
 fn dns_backup_path() -> Result<PathBuf> {
@@ -119,30 +195,47 @@ const GEO_STAGE_SUBDIR: &str = "geo";
 const GEO_FILES: [&str; 2] = ["geoip.dat", "geosite.dat"];
 const GEO_MAX_SIZE: u64 = 64 << 20;
 
-/// Copy one geo file from the client's directory into `dst_dir` without trusting the
-/// source path: open with O_NOFOLLOW (+O_NONBLOCK so a FIFO cannot hang root), check the
-/// opened fd (regular file, owned by the client, size limit) and read through that same
-/// fd. The data goes to an O_EXCL temp file that is fsynced and renamed over the old one.
-/// A missing source removes any previously staged copy.
-fn copy_geo_file(src_dir: &Path, dst_dir: &Path, name: &str, client_uid: u32, max_size: u64) -> Result<()> {
+fn unlinkat_if_exists(dir: &File, name: &OsStr) -> std::io::Result<()> {
+    let c = cstring(name)?;
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+fn renameat_in(dir: &File, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
+    let (f, t) = (cstring(from)?, cstring(to)?);
+    if unsafe { libc::renameat(dir.as_raw_fd(), f.as_ptr(), dir.as_raw_fd(), t.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Copy one geo file from the client's directory into `dst_dir` without trusting any
+/// path. Both directories are given as canonical paths and are walked from "/" with
+/// O_NOFOLLOW (a symlink anywhere is an error). The source is opened with
+/// openat(dirfd, name, O_NOFOLLOW|O_NONBLOCK) (so a FIFO cannot hang root), checked with
+/// fstat on that fd (regular file, owned by the client, size limit) and read through it.
+/// The data goes to an O_EXCL temp file created in the destination directory fd, fsynced
+/// and renamed with renameat over the old one. A missing source removes any previously
+/// staged copy.
+fn copy_geo_file_canonical(src_dir: &Path, dst_dir: &Path, name: &str, client_uid: u32, max_size: u64) -> Result<()> {
     use std::io::Read;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::MetadataExt;
     static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+    let src_fd = open_dir_nofollow(src_dir).context("cannot open geo source directory")?;
+    let dst_fd = open_dir_nofollow(dst_dir).context("cannot open geo staging directory")?;
     let src = src_dir.join(name);
     let dst = dst_dir.join(name);
-    let input = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(&src)
-    {
+    let input = match openat_fd(src_fd.as_raw_fd(), OsStr::new(name), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC, 0) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            match std::fs::remove_file(&dst) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e).with_context(|| format!("cannot remove stale {}", dst.display())),
-            }
+            unlinkat_if_exists(&dst_fd, OsStr::new(name))
+                .with_context(|| format!("cannot remove stale {}", dst.display()))?;
             return Ok(());
         }
         Err(e) => return Err(e).with_context(|| format!("cannot open {}", src.display())),
@@ -158,18 +251,18 @@ fn copy_geo_file(src_dir: &Path, dst_dir: &Path, name: &str, client_uid: u32, ma
         bail!("{} is too large ({} bytes, limit {max_size})", src.display(), meta.len());
     }
 
-    let tmp = dst_dir.join(format!(
+    let tmp_name = std::ffi::OsString::from(format!(
         ".{name}.{}.{}.tmp",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    let mut out = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&tmp)
-        .with_context(|| format!("cannot create {}", tmp.display()))?;
+    let mut out = openat_fd(
+        dst_fd.as_raw_fd(),
+        &tmp_name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o600,
+    )
+    .with_context(|| format!("cannot create temp file for {}", dst.display()))?;
     let written = (|| -> Result<()> {
         // The file may grow after fstat: bound the actual read as well.
         let n = std::io::copy(&mut (&input).take(max_size + 1), &mut out)?;
@@ -180,11 +273,19 @@ fn copy_geo_file(src_dir: &Path, dst_dir: &Path, name: &str, client_uid: u32, ma
         Ok(())
     })();
     drop(out);
-    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, &dst).map_err(Into::into)) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = written.and_then(|()| renameat_in(&dst_fd, &tmp_name, OsStr::new(name)).map_err(Into::into)) {
+        let _ = unlinkat_if_exists(&dst_fd, &tmp_name);
         return Err(e);
     }
     Ok(())
+}
+
+/// Canonicalize both directories once, then do all work relative to descriptors
+/// obtained by a no-symlink walk of the canonical paths.
+fn copy_geo_file(src_dir: &Path, dst_dir: &Path, name: &str, client_uid: u32, max_size: u64) -> Result<()> {
+    let src = src_dir.canonicalize().with_context(|| format!("invalid geo source {}", src_dir.display()))?;
+    let dst = dst_dir.canonicalize().with_context(|| format!("invalid geo staging dir {}", dst_dir.display()))?;
+    copy_geo_file_canonical(&src, &dst, name, client_uid, max_size)
 }
 
 fn copy_geo_files(src_dir: &Path, dst_dir: &Path, client_uid: u32, max_size: u64) -> Result<()> {
@@ -335,6 +436,15 @@ pub async fn main() -> Result<()> {
         .and_then(|i| args.get(i + 1))
         .and_then(|u| u.parse().ok())
         .context("usage: veil-helper --uid <uid>")?;
+
+    // The helper may have been killed (or crashed) while TUN had DNS overridden; launchd
+    // restarts it, but nothing would put DNS back until the next Start. No engine runs yet,
+    // so a backup file can only be a leftover.
+    match dns_backup_path().and_then(|p| veil_sysproxy::dns_restore(&p)) {
+        Ok(true) => tracing::info!("restored DNS settings left by a previous run"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!("cannot restore leftover DNS settings: {e:#}"),
+    }
 
     let _ = std::fs::remove_file(SOCKET_PATH);
     let listener = UnixListener::bind(SOCKET_PATH).context("cannot bind helper socket")?;
@@ -559,5 +669,88 @@ mod tests {
         std::os::unix::fs::symlink(&d, &link).unwrap();
         assert!(ensure_private_dir(&link, current_uid()).is_err());
         assert!(ensure_private_dir(&d, current_uid().wrapping_add(1)).is_err());
+    }
+
+    /// Canonical scratch dir (on macOS the temp dir lives behind the /var -> /private/var link).
+    fn canon_scratch(tag: &str) -> (TmpDir, PathBuf) {
+        let t = scratch(tag);
+        let c = t.0.canonicalize().unwrap();
+        (t, c)
+    }
+
+    #[test]
+    fn walk_rejects_symlink_in_intermediate_component() {
+        let (_t, base) = canon_scratch("walk-mid");
+        std::fs::create_dir_all(base.join("real/sub")).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        assert!(open_dir_nofollow(&base.join("real/sub")).is_ok());
+        assert!(open_dir_nofollow(&base.join("link/sub")).is_err());
+        assert!(open_dir_nofollow(&base.join("link")).is_err());
+        assert!(open_dir_nofollow(Path::new("relative/path")).is_err());
+        assert!(open_dir_nofollow(&base.join("real/../real")).is_err());
+    }
+
+    #[test]
+    fn copy_rejects_symlink_on_source_intermediate_dir() {
+        let (_t, base) = canon_scratch("src-mid");
+        std::fs::create_dir_all(base.join("real/geo")).unwrap();
+        std::fs::write(base.join("real/geo/geoip.dat"), b"data").unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        let dst = base.join("dst");
+        std::fs::create_dir(&dst).unwrap();
+        // Same file through the clean path works...
+        copy_geo_file_canonical(&base.join("real/geo"), &dst, "geoip.dat", current_uid(), 1024).unwrap();
+        std::fs::remove_file(dst.join("geoip.dat")).unwrap();
+        // ...but not through a swapped-in intermediate symlink.
+        assert!(copy_geo_file_canonical(&base.join("link/geo"), &dst, "geoip.dat", current_uid(), 1024).is_err());
+        assert!(!dst.join("geoip.dat").exists());
+    }
+
+    #[test]
+    fn copy_rejects_symlink_on_destination_dir() {
+        let (_t, base) = canon_scratch("dst-mid");
+        let src = base.join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("geoip.dat"), b"data").unwrap();
+        std::fs::create_dir_all(base.join("real/stage")).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        // symlink on an intermediate component of the destination
+        assert!(copy_geo_file_canonical(&src, &base.join("link/stage"), "geoip.dat", current_uid(), 1024).is_err());
+        // symlink as the destination directory itself
+        assert!(copy_geo_file_canonical(&src, &base.join("link"), "geoip.dat", current_uid(), 1024).is_err());
+        assert!(!base.join("real/stage/geoip.dat").exists());
+        assert!(!base.join("real/geoip.dat").exists());
+    }
+
+    #[test]
+    fn private_dir_rejects_symlink_on_intermediate_component() {
+        let (_t, base) = canon_scratch("priv-mid");
+        std::fs::create_dir_all(base.join("real")).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        assert!(ensure_private_dir_canonical(&base.join("link/geo"), current_uid()).is_err());
+        assert!(!base.join("real/geo").exists());
+        ensure_private_dir_canonical(&base.join("real/geo"), current_uid()).unwrap();
+        assert!(base.join("real/geo").is_dir());
+    }
+
+    #[test]
+    fn private_dir_fixes_loose_mode_via_fd() {
+        use std::os::unix::fs::MetadataExt;
+        let (_t, base) = canon_scratch("priv-mode");
+        let d = base.join("geo");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&d, current_uid()).unwrap();
+        assert_eq!(std::fs::metadata(&d).unwrap().mode() & 0o7777, 0o700);
+    }
+
+    #[test]
+    fn copy_works_through_non_canonical_temp_path() {
+        // On macOS std::env::temp_dir() is under /var -> /private/var: the public entry
+        // point canonicalizes first, so it must still succeed.
+        let (src, dst) = src_dst("noncanon");
+        std::fs::write(src.0.join("geosite.dat"), b"abc").unwrap();
+        copy_geo_file(&src.0, &dst.0, "geosite.dat", current_uid(), 1024).unwrap();
+        assert_eq!(std::fs::read(dst.0.join("geosite.dat")).unwrap(), b"abc");
     }
 }

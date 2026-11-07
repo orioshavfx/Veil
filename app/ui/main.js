@@ -6,6 +6,9 @@ let state = null;
 let busy = false;
 let busyLabel = null; // status text while a connection action runs
 let last = null; // previous traffic sample, for speed
+let shownError = null; // last backend error already shown as a toast
+let polling = false; // a traffic/state request is in flight
+let idleTicks = 0;
 let showSpeed = true; // speed readout on/off (remembered per device)
 try { showSpeed = localStorage.getItem('veil.speed') !== '0'; } catch {}
 
@@ -18,7 +21,7 @@ const MODE_DESC = {
   },
   windows: {
     proxy: 'Uses the Windows system proxy. No administrator rights needed.',
-    tun: 'Routes all traffic, including apps that ignore the proxy. Asks for administrator permission.',
+    tun: 'Routes all traffic, including apps that ignore the proxy. Veil restarts with administrator permission (Windows asks you to confirm).',
   },
 };
 const ROUTING_DESC = {
@@ -52,6 +55,7 @@ async function call(cmd, args) {
   try {
     return await invoke(cmd, args);
   } catch (e) {
+    shownError = String(e); // the backend also keeps it as `state.error`
     toast(String(e), true);
     throw e;
   }
@@ -92,6 +96,15 @@ function setName(node, text) {
 async function reload() {
   state = await invoke('snapshot');
   render();
+  showBackendError();
+}
+
+// Errors of actions the UI did not start itself (the elevated copy connecting on
+// startup, the tray menu) are only known to the backend: show them once.
+function showBackendError() {
+  const e = state?.error ?? null;
+  if (e && e !== shownError) toast(e, true);
+  shownError = e;
 }
 
 /// Runs one action at a time; clicks during it are ignored instead of queued.
@@ -140,6 +153,7 @@ function render() {
   const presetName = (s.presets.find(([n]) => n === s.preset) || [])[1] || '';
   $('caption').textContent = `${MODE_NAMES[s.mode]} · ${presetName}`;
   if (!s.connected) {
+    last = null;
     $('up').textContent = $('down').textContent = showSpeed ? '0 B/s' : '';
     $('timer').textContent = clock(0);
   }
@@ -476,17 +490,41 @@ $('speed-toggle').onclick = () => {
 };
 
 async function tick() {
-  if (!state?.connected) { last = null; return; }
-  const t = await invoke('traffic');
-  if (!t.connected) { reload(); return; }
-  const now = performance.now();
-  if (showSpeed && last) {
-    const dt = (now - last.at) / 1000;
-    $('up').textContent = `${bytes(Math.max(0, t.upload - last.upload) / dt)}/s`;
-    $('down').textContent = `${bytes(Math.max(0, t.download - last.download) / dt)}/s`;
+  if (polling) return; // never overlap: slow replies would give a bogus speed
+  polling = true;
+  try {
+    if (!state?.connected) {
+      last = null;
+      // A connection can appear without a click (elevated copy, tray menu) and the
+      // event may fire before this page listens: look again every few seconds.
+      if (!busy && ++idleTicks >= 3) {
+        idleTicks = 0;
+        const s = await invoke('snapshot');
+        if (!busy && (s.connected !== state?.connected || (s.error ?? null) !== (state?.error ?? null))) {
+          state = s;
+          render();
+          showBackendError();
+        }
+      }
+      return;
+    }
+    const t = await invoke('traffic');
+    // Disconnected (or reconnected) while waiting: the sample belongs to the old session.
+    if (!state?.connected) return;
+    if (!t.connected) { reload(); return; }
+    const now = performance.now();
+    if (showSpeed && last && now > last.at && t.seconds >= last.seconds) {
+      const dt = (now - last.at) / 1000;
+      $('up').textContent = `${bytes(Math.max(0, t.upload - last.upload) / dt)}/s`;
+      $('down').textContent = `${bytes(Math.max(0, t.download - last.download) / dt)}/s`;
+    }
+    $('timer').textContent = clock(t.seconds);
+    last = { ...t, at: now };
+  } catch {
+    last = null;
+  } finally {
+    polling = false;
   }
-  $('timer').textContent = clock(t.seconds);
-  last = { ...t, at: now };
 }
 
 setRuleKind('site');

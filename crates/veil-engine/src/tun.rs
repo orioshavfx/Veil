@@ -171,13 +171,19 @@ impl Tun {
             anyhow::bail!("TUN mode needs root: run with sudo");
         }
         // Undo leftovers of a run that crashed before touching anything else.
-        veil_sysproxy::dns_restore(&opts.dns_backup)?;
+        let backup = opts.dns_backup.clone();
+        blocking(move || veil_sysproxy::dns_restore(&backup)).await??;
 
-        let (phys, bypass) = physical_bypass()?;
+        let (phys, bypass) = blocking(physical_bypass).await??;
         let upstream = bypass.dns.clone();
-        let gateway = veil_sysproxy::default_gateway().ok();
+        let gateway = blocking(|| veil_sysproxy::default_gateway().ok()).await?;
         tracing::info!("physical interface {phys}, gateway {gateway:?}, direct DNS {upstream:?}");
         dial::set_bypass(Some(bypass));
+        // Host routes of a run that died without cleaning up would outlive it.
+        #[cfg(windows)]
+        if let Some(gw) = gateway {
+            let _ = blocking(move || veil_sysproxy::cleanup_orphan_host_routes(gw)).await;
+        }
 
         let result = Self::bring_up(shared, &opts, phys, gateway).await;
         if let Ok(tun) = &result {
@@ -185,7 +191,8 @@ impl Tun {
         }
         if result.is_err() {
             dial::set_bypass(None);
-            let _ = veil_sysproxy::dns_restore(&opts.dns_backup);
+            let backup = opts.dns_backup.clone();
+            let _ = blocking(move || veil_sysproxy::dns_restore(&backup)).await;
         }
         result
     }
@@ -200,27 +207,33 @@ impl Tun {
         let name = dev.name()?;
         // Keep our own sockets (pinned to the physical interface) routable once
         // the split routes send everything else into the tunnel.
-        let scoped_default = opts.routes != TunRoutes::Domains
-            && gateway.is_some_and(|gw| veil_sysproxy::add_scoped_default(&phys, gw));
-        let undo = |name: &str| {
-            veil_sysproxy::remove_tun_routes(name);
-            if scoped_default {
-                veil_sysproxy::remove_scoped_default(&phys);
+        let scoped_default = match gateway {
+            Some(gw) if opts.routes != TunRoutes::Domains => {
+                let phys = phys.clone();
+                blocking(move || veil_sysproxy::add_scoped_default(&phys, gw)).await?
             }
+            _ => false,
         };
-        if let Err(e) = veil_sysproxy::add_tun_routes(&name, opts.routes) {
-            undo(&name);
+        let undo = || undo_routes(name.clone(), phys.clone(), scoped_default);
+        let routes = opts.routes;
+        let n = name.clone();
+        if let Err(e) = blocking(move || veil_sysproxy::add_tun_routes(&n, routes)).await.and_then(|r| r) {
+            undo().await;
             return Err(e);
         }
-        if let Err(e) = veil_sysproxy::dns_override(&[IpAddr::V4(DNS_ADDR)], &opts.dns_backup) {
-            undo(&name);
+        let backup = opts.dns_backup.clone();
+        if let Err(e) = blocking(move || veil_sysproxy::dns_override(&[IpAddr::V4(DNS_ADDR)], &backup))
+            .await
+            .and_then(|r| r)
+        {
+            undo().await;
             return Err(e);
         }
         tracing::info!("TUN {name} up ({:?})", opts.routes);
 
         let mut cfg = IpStackConfig::default();
         if let Err(e) = cfg.mtu(opts.mtu) {
-            undo(&name);
+            undo().await;
             return Err(anyhow::anyhow!("{e:?}"));
         }
         cfg.udp_timeout(UDP_IDLE);
@@ -279,29 +292,88 @@ impl Tun {
                 return;
             }
         };
-        let mut routes = self.host_routes.lock().unwrap();
-        for ip in ips {
-            if !routes.contains(&ip) && veil_sysproxy::add_host_route(ip, gw) {
-                routes.push(ip);
+        let new: Vec<IpAddr> = {
+            let known = self.host_routes.lock().unwrap();
+            ips.into_iter().filter(|ip| !known.contains(ip)).collect()
+        };
+        if new.is_empty() {
+            return;
+        }
+        let added = blocking(move || {
+            new.into_iter()
+                .filter(|&ip| {
+                    let ok = veil_sysproxy::add_host_route(ip, gw);
+                    if !ok && ip.is_ipv6() {
+                        tracing::warn!("IPv6 server {ip} has no host route: its connections are not protected from looping into the tunnel");
+                    }
+                    ok
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+        match added {
+            Ok(added) => {
+                let mut routes = self.host_routes.lock().unwrap();
+                for ip in added {
+                    if !routes.contains(&ip) {
+                        routes.push(ip);
+                    }
+                }
             }
+            Err(e) => tracing::warn!("host routes: {e:#}"),
         }
     }
 
     pub(crate) async fn stop(self) {
         self.task.abort();
         let _ = self.task.await;
-        veil_sysproxy::remove_tun_routes(&self.name);
-        for ip in self.host_routes.lock().unwrap().drain(..) {
-            veil_sysproxy::remove_host_route(ip);
-        }
-        if self.scoped_default {
-            veil_sysproxy::remove_scoped_default(&self.phys);
-        }
-        if let Err(e) = veil_sysproxy::dns_restore(&self.dns_backup) {
-            tracing::error!("restoring DNS: {e:#}");
+        let host_routes: Vec<IpAddr> = self.host_routes.lock().unwrap().drain(..).collect();
+        let Self { name, phys, gateway, scoped_default, dns_backup, .. } = self;
+        let name_log = name.clone();
+        let res = blocking(move || {
+            veil_sysproxy::remove_tun_routes(&name);
+            for ip in host_routes {
+                remove_host_route(ip, gateway);
+            }
+            if scoped_default {
+                veil_sysproxy::remove_scoped_default(&phys);
+            }
+            if let Err(e) = veil_sysproxy::dns_restore(&dns_backup) {
+                tracing::error!("restoring DNS: {e:#}");
+            }
+        })
+        .await;
+        if let Err(e) = res {
+            tracing::error!("TUN teardown: {e:#}");
         }
         dial::set_bypass(None);
-        tracing::info!("TUN {} down", self.name);
+        tracing::info!("TUN {name_log} down");
+    }
+}
+
+/// Runs a blocking call (PowerShell and friends) off the async workers.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    tokio::task::spawn_blocking(f).await.context("blocking task failed")
+}
+
+async fn undo_routes(name: String, phys: String, scoped_default: bool) {
+    let _ = blocking(move || {
+        veil_sysproxy::remove_tun_routes(&name);
+        if scoped_default {
+            veil_sysproxy::remove_scoped_default(&phys);
+        }
+    })
+    .await;
+}
+
+/// Removes a host route; on Windows only the one through `gateway` when it is known.
+fn remove_host_route(ip: IpAddr, gateway: Option<IpAddr>) {
+    #[cfg(windows)]
+    veil_sysproxy::remove_host_route_via(ip, gateway);
+    #[cfg(not(windows))]
+    {
+        let _ = gateway;
+        veil_sysproxy::remove_host_route(ip);
     }
 }
 

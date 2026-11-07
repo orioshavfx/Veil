@@ -30,6 +30,10 @@ pub struct Core {
     relaunch: bool,
     /// Started by `--connect-tun`: never ask for elevation again (no UAC loops).
     no_relaunch: bool,
+    /// An elevated copy has been started and this one is on its way out: a second
+    /// `connect` (double click, tray menu) must not show another UAC prompt.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    elevated_started: bool,
 }
 
 #[derive(Serialize)]
@@ -133,7 +137,7 @@ impl Core {
         }
         // Leftovers of a crash: put the user's proxy settings back.
         let _ = veil_sysproxy::restore(&store.dir().join("sysproxy-backup.json"));
-        Ok(Self { store, state, conn: None, connected_at: None, last_error: None, relaunch: false, no_relaunch: false })
+        Ok(Self { store, state, conn: None, connected_at: None, last_error: None, relaunch: false, no_relaunch: false, elevated_started: false })
     }
 
     fn save(&self) -> Result<()> {
@@ -395,9 +399,21 @@ impl Core {
     }
 
     pub async fn set_mode(&mut self, mode: ConnectionMode) -> Result<()> {
+        let previous = self.state.settings.mode;
+        let was_connected = self.conn.is_some();
         self.state.settings.mode = mode;
         self.save()?;
-        self.reconnect_if_connected().await
+        let Err(e) = self.reconnect_if_connected().await else { return Ok(()) };
+        // The new mode could not start (UAC declined, wintun.dll missing, ...): go back to the
+        // old mode and its connection, so the user is not left offline with a mode that cannot work.
+        if was_connected && self.conn.is_none() {
+            self.state.settings.mode = previous;
+            let _ = self.save();
+            if self.connect().await.is_ok() {
+                self.last_error = Some(format!("{e:#}"));
+            }
+        }
+        Err(e)
     }
 
     pub async fn set_preset(&mut self, name: &str) -> Result<()> {
@@ -479,7 +495,7 @@ impl Core {
     }
 
     async fn connect_inner(&mut self) -> Result<()> {
-        if self.conn.is_some() {
+        if self.conn.is_some() || self.elevated_started {
             return Ok(());
         }
         let profile = self.state.selected_profile().context("add a server first")?.clone();
@@ -521,8 +537,10 @@ impl Core {
                         if self.no_relaunch {
                             bail!("TUN mode needs administrator rights; start Veil as administrator");
                         }
-                        win::relaunch_elevated()?;
+                        // The UAC prompt blocks until answered: keep it off the async workers.
+                        tokio::task::spawn_blocking(win::relaunch_elevated).await??;
                         self.relaunch = true;
+                        self.elevated_started = true;
                         return Ok(());
                     }
                     let engine = Engine::start(EngineConfig {
@@ -697,14 +715,24 @@ mod win {
         let wide = |s: &std::ffi::OsStr| s.encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
         let verb = wide(std::ffi::OsStr::new("runas"));
         let file = wide(exe.as_os_str());
-        let args = wide(std::ffi::OsStr::new(super::CONNECT_TUN_ARG));
+        // The new copy waits for this process to exit before it opens its WebView
+        // (the user data folder cannot be shared between elevation levels).
+        let args = wide(std::ffi::OsStr::new(&format!(
+            "{} {}={}",
+            super::CONNECT_TUN_ARG,
+            super::AFTER_PID_ARG,
+            std::process::id()
+        )));
+        // An elevated start would otherwise use System32 as the working directory.
+        let dir = exe.parent().map(|d| wide(d.as_os_str()));
+        let dir_ptr = dir.as_ref().map_or(std::ptr::null(), |d| d.as_ptr());
         let code = unsafe {
-            ShellExecuteW(null_mut(), verb.as_ptr(), file.as_ptr(), args.as_ptr(), std::ptr::null(), SW_SHOWNORMAL)
+            ShellExecuteW(null_mut(), verb.as_ptr(), file.as_ptr(), args.as_ptr(), dir_ptr, SW_SHOWNORMAL)
         } as isize;
         match code {
             c if c > 32 => Ok(()),
             // SE_ERR_ACCESSDENIED: the UAC prompt was declined.
-            5 => bail!("Administrator permission was declined"),
+            5 => bail!("Administrator permission was declined; TUN mode cannot start without it"),
             c => bail!("could not restart Veil as administrator (error {c})"),
         }
     }
@@ -715,13 +743,24 @@ mod win {
         if exe.parent().is_some_and(|d| d.join("wintun.dll").is_file()) {
             Ok(())
         } else {
-            bail!("wintun.dll not found next to Veil.exe")
+            bail!("wintun.dll not found next to Veil.exe ({}); reinstall Veil", exe.display())
         }
     }
 }
 
 /// Command-line flag of the elevated copy: connect in TUN mode as soon as the UI is up.
 pub const CONNECT_TUN_ARG: &str = "--connect-tun";
+
+/// Command-line flag of the elevated copy: `--after-pid=N`, wait for process N (the copy
+/// that started us) to exit before touching the WebView.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const AFTER_PID_ARG: &str = "--after-pid";
+
+/// The pid given with `--after-pid=N`, if any.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn after_pid<I: IntoIterator<Item = String>>(args: I) -> Option<u32> {
+    args.into_iter().find_map(|a| a.strip_prefix("--after-pid=")?.parse().ok())
+}
 
 /// Whether the command line (without the program name) asks for `--connect-tun`.
 pub fn wants_connect_tun<I: IntoIterator<Item = String>>(args: I) -> bool {
@@ -748,7 +787,7 @@ fn helper_binary() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod arg_tests {
-    use super::wants_connect_tun;
+    use super::{after_pid, wants_connect_tun};
 
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
@@ -760,6 +799,14 @@ mod arg_tests {
         assert!(wants_connect_tun(args(&["--x", "--connect-tun"])));
         assert!(!wants_connect_tun(args(&[])));
         assert!(!wants_connect_tun(args(&["--connect-tunnel", "connect-tun"])));
+    }
+
+    #[test]
+    fn after_pid_flag() {
+        assert_eq!(after_pid(args(&["--connect-tun", "--after-pid=1234"])), Some(1234));
+        assert_eq!(after_pid(args(&["--after-pid=x"])), None);
+        assert_eq!(after_pid(args(&["--after-pid"])), None);
+        assert_eq!(after_pid(args(&[])), None);
     }
 }
 

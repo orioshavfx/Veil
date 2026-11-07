@@ -11,6 +11,7 @@ path = "src/bin/veil-helper.rs"
 [dependencies]
 veil-config.workspace = true
 veil-engine.workspace = true
+veil-sysproxy.workspace = true
 anyhow.workspace = true
 libc = "0.2"
 serde.workspace = true

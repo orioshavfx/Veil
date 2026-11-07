@@ -454,8 +454,31 @@ mod single_instance {
     }
 }
 
+/// Waits for the process that started us through UAC to be gone: WebView2 refuses to share
+/// a user data folder between a normal and an elevated process, and its browser process
+/// lingers a moment after the host exits.
+#[cfg(windows)]
+fn wait_for_exit(pid: u32, timeout: Duration) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+    unsafe {
+        let process = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if process.is_null() {
+            return; // already gone
+        }
+        WaitForSingleObject(process, timeout.as_millis() as u32);
+        CloseHandle(process);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+}
+
 fn main() {
-    let connect_tun = core::wants_connect_tun(std::env::args().skip(1));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let connect_tun = core::wants_connect_tun(args.iter().cloned());
+    #[cfg(windows)]
+    if let Some(pid) = core::after_pid(args.iter().cloned()) {
+        wait_for_exit(pid, Duration::from_secs(10));
+    }
     #[cfg(windows)]
     if !single_instance::acquire(if connect_tun { Duration::from_secs(5) } else { Duration::ZERO }) {
         return;

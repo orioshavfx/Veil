@@ -341,23 +341,52 @@ pub fn dns_override(servers: &[IpAddr], _backup_path: &Path) -> Result<()> {
     let name = TUN_NAME.lock().unwrap().clone().context("TUN adapter is not set up yet")?;
     let idx = interface_index(&name)?;
     ps(&winnet::set_dns_script(idx.get(), servers), &[]).context("cannot set DNS on the TUN adapter")?;
+    // Windows also asks the physical adapters' servers in parallel (SMHNR); an NRPT rule for
+    // `.` makes our resolver the only one. Without it names leak, but the tunnel still works.
+    match ps(&winnet::nrpt_add_script(servers), &[]) {
+        Ok(_) => tracing::info!("NRPT rule '{}' added: all DNS names go to {servers:?}", winnet::NRPT_TAG),
+        Err(e) => tracing::warn!("NRPT rule not added, DNS may leak through other adapters: {e:#}"),
+    }
     flush_dns_cache();
     Ok(())
+}
+
+/// Deletes our NRPT rules (by tag). Idempotent; true when the command ran.
+fn remove_nrpt_rules() -> bool {
+    match ps(&winnet::nrpt_remove_script(), &[]) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("cannot remove the NRPT rule: {e:#}");
+            false
+        }
+    }
 }
 
 /// Resets DNS on the TUN adapter if it still exists. Idempotent. A stale
 /// backup file from other platforms' logic is simply deleted.
 pub fn dns_restore(backup_path: &Path) -> Result<bool> {
     let _ = std::fs::remove_file(backup_path);
-    let Some(name) = TUN_NAME.lock().unwrap().take() else { return Ok(false) };
-    // The adapter is usually gone by now; the lookup is by name, so a reused index is never touched.
-    let Ok(idx) = interface_index(&name) else { return Ok(false) };
-    if let Err(e) = ps(&winnet::reset_dns_script(idx.get()), &[]) {
-        tracing::warn!("{e:#}");
-        return Ok(false);
+    // Also cleans a rule left by a crashed run, whether or not this process set up an adapter.
+    let nrpt = remove_nrpt_rules();
+    let name = TUN_NAME.lock().unwrap().take();
+    let reset = match name {
+        // The adapter is usually gone by now; the lookup is by name, so a reused index is never touched.
+        Some(name) => match interface_index(&name) {
+            Ok(idx) => match ps(&winnet::reset_dns_script(idx.get()), &[]) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!("{e:#}");
+                    false
+                }
+            },
+            Err(_) => false,
+        },
+        None => false,
+    };
+    if nrpt || reset {
+        flush_dns_cache();
     }
-    flush_dns_cache();
-    Ok(true)
+    Ok(reset)
 }
 
 pub fn flush_dns_cache() {
@@ -377,8 +406,11 @@ pub fn add_tun_routes(iface: &str, routes: TunRoutes) -> Result<()> {
     winnet::validate_alias(iface)?;
     *TUN_NAME.lock().unwrap() = Some(iface.to_string());
     let idx = wait_interface_index(iface)?;
-    ps(&winnet::add_routes_script(idx.get(), routes), &[])
+    let out = ps(&winnet::add_routes_script(idx.get(), routes), &[])
         .with_context(|| format!("cannot add TUN routes (administrator rights needed) on {iface}"))?;
+    for f in winnet::parse_route_failures(&out) {
+        tracing::warn!("IPv6 route {f}; IPv6 traffic may bypass the tunnel");
+    }
     Ok(())
 }
 
@@ -401,8 +433,9 @@ pub fn add_scoped_default(_phys: &str, _gateway: IpAddr) -> bool {
 pub fn remove_scoped_default(_phys: &str) {}
 
 /// Host route to the proxy server through the original gateway and its interface.
+/// An IPv6 server is routed via the IPv6 default route's gateway instead (`gateway` is IPv4).
 pub fn add_host_route(ip: IpAddr, gateway: IpAddr) -> bool {
-    if !ip.is_ipv4() || !gateway.is_ipv4() {
+    if ip.is_ipv4() && !gateway.is_ipv4() {
         return false;
     }
     match ps(&winnet::add_host_route_script(ip, gateway), &[]) {
@@ -415,7 +448,34 @@ pub fn add_host_route(ip: IpAddr, gateway: IpAddr) -> bool {
 }
 
 pub fn remove_host_route(ip: IpAddr) {
-    if ip.is_ipv4() && let Err(e) = ps(&winnet::remove_host_route_script(ip), &[]) {
+    remove_host_route_via(ip, None);
+}
+
+/// Like [`remove_host_route`], but with a known gateway only a route through it is removed.
+pub fn remove_host_route_via(ip: IpAddr, gateway: Option<IpAddr>) {
+    if let Err(e) = ps(&winnet::remove_host_route_script(ip, gateway), &[]) {
         tracing::warn!("{e:#}");
+    }
+}
+
+/// Removes leftover /32 host routes (metric 1) through `gateway` from a run that crashed.
+/// Returns how many were removed. Best effort.
+pub fn cleanup_orphan_host_routes(gateway: IpAddr) -> usize {
+    if !gateway.is_ipv4() {
+        return 0;
+    }
+    let gw = gateway.to_string();
+    match ps(winnet::CLEAN_ORPHAN_ROUTES_SCRIPT, &[("VEIL_GW", gw.as_str())]) {
+        Ok(out) => {
+            let removed: Vec<&str> = out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+            if !removed.is_empty() {
+                tracing::info!("removed stale host routes via {gateway}: {removed:?}");
+            }
+            removed.len()
+        }
+        Err(e) => {
+            tracing::warn!("cleaning stale host routes: {e:#}");
+            0
+        }
     }
 }

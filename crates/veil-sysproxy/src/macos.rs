@@ -58,6 +58,26 @@ impl ServiceBackup {
     }
 }
 
+/// Writes a backup so that a crash never leaves a truncated file behind: temp file in the
+/// same directory, fsync, rename over the target.
+fn write_backup(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    let res = (|| -> Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
 fn networksetup(args: &[&str]) -> Result<String> {
     let out = Command::new("/usr/sbin/networksetup")
         .args(args)
@@ -198,8 +218,7 @@ pub fn enable(host: &str, port: u16, backup_path: &Path) -> Result<()> {
     let targets = target_services()?;
     if !backup_path.exists() {
         let backup: Vec<ServiceBackup> = targets.iter().map(|s| read_service(s)).collect::<Result<_>>()?;
-        std::fs::write(backup_path, serde_json::to_vec_pretty(&backup)?)
-            .context("cannot write proxy backup")?;
+        write_backup(backup_path, &serde_json::to_vec_pretty(&backup)?).context("cannot write proxy backup")?;
     }
     let ours = ProxyEntry { enabled: true, server: host.to_string(), port };
     let bypass: Vec<String> = BYPASS.iter().map(|s| s.to_string()).collect();
@@ -302,10 +321,59 @@ fn parse_scutil_dns(out: &str) -> Vec<std::net::IpAddr> {
     servers
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct DnsBackup {
     service: String,
     servers: Vec<String>,
+}
+
+/// Reads a DNS backup, current or legacy:
+/// * current: `[{"service": "Wi-Fi", "servers": ["1.1.1.1"]}, ...]`
+/// * a single `{"service": ..., "servers": ...}` object
+/// * a map `{"Wi-Fi": ["1.1.1.1"], "Ethernet": []}`
+///
+/// `servers` may be missing, `null`, a string or an array. Entries that could be passed to
+/// `networksetup` as something other than a DNS address (or a service starting with `-`)
+/// are dropped, since the file is read back by a privileged process.
+fn parse_dns_backup(data: &[u8]) -> Result<Vec<DnsBackup>> {
+    use serde_json::Value;
+
+    fn servers(v: &Value) -> Vec<String> {
+        let raw: Vec<&str> = match v {
+            Value::String(s) => vec![s.as_str()],
+            Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        };
+        raw.into_iter()
+            .map(str::trim)
+            .filter(|s| s.parse::<std::net::IpAddr>().is_ok())
+            .map(str::to_string)
+            .collect()
+    }
+    fn entry(service: &str, servers: Vec<String>) -> Option<DnsBackup> {
+        (!service.is_empty() && !service.starts_with('-')).then(|| DnsBackup { service: service.to_string(), servers })
+    }
+    fn item(v: &Value) -> Option<DnsBackup> {
+        let o = v.as_object()?;
+        let service = o.get("service")?.as_str()?;
+        entry(service, o.get("servers").map(servers).unwrap_or_default())
+    }
+
+    let v: Value = serde_json::from_slice(data).context("corrupt DNS backup")?;
+    match &v {
+        Value::Array(a) => a.iter().map(|x| item(x).context("corrupt DNS backup: bad entry")).collect(),
+        Value::Object(o) if o.contains_key("service") => Ok(vec![item(&v).context("corrupt DNS backup: bad entry")?]),
+        Value::Object(o) => o
+            .iter()
+            .map(|(k, v)| {
+                if !matches!(v, Value::Array(_) | Value::Null | Value::String(_)) {
+                    bail!("corrupt DNS backup: bad entry for {k}");
+                }
+                entry(k, servers(v)).with_context(|| format!("corrupt DNS backup: bad service {k:?}"))
+            })
+            .collect(),
+        _ => bail!("corrupt DNS backup: unexpected JSON"),
+    }
 }
 
 /// Points every enabled service's DNS at `servers`, saving the old values.
@@ -321,7 +389,7 @@ pub fn dns_override(servers: &[std::net::IpAddr], backup_path: &Path) -> Result<
             };
             backup.push(DnsBackup { service, servers });
         }
-        std::fs::write(backup_path, serde_json::to_vec_pretty(&backup)?)?;
+        write_backup(backup_path, &serde_json::to_vec_pretty(&backup)?).context("cannot write DNS backup")?;
     }
     let list: Vec<String> = servers.iter().map(|s| s.to_string()).collect();
     for service in services()? {
@@ -339,7 +407,19 @@ pub fn dns_restore(backup_path: &Path) -> Result<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e.into()),
     };
-    let backup: Vec<DnsBackup> = serde_json::from_slice(&data).context("corrupt DNS backup")?;
+    let backup = match parse_dns_backup(&data) {
+        Ok(b) => b,
+        Err(e) => {
+            // A broken file must not block every later TUN start: keep it for inspection.
+            tracing::error!("{e:#}; moving {} aside", backup_path.display());
+            let mut aside = backup_path.as_os_str().to_owned();
+            aside.push(".corrupt");
+            if std::fs::rename(backup_path, &aside).is_err() {
+                let _ = std::fs::remove_file(backup_path);
+            }
+            return Ok(false);
+        }
+    };
     for b in &backup {
         let mut args = vec!["-setdnsservers", b.service.as_str()];
         if b.servers.is_empty() {
@@ -351,7 +431,11 @@ pub fn dns_restore(backup_path: &Path) -> Result<bool> {
             tracing::warn!("{e:#}");
         }
     }
-    std::fs::remove_file(backup_path)?;
+    match std::fs::remove_file(backup_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
     flush_dns_cache();
     Ok(true)
 }
@@ -468,5 +552,75 @@ mod dns_tests {
         let out = "Destination        Gateway            Flags               Netif Expire\ndefault            172.20.10.1        UGScg                 en0\n128.0/1            169.254.10.1       UGSc              utun225\n";
         assert_eq!(parse_split_routes(out, "utun9"), vec!["utun225"]);
         assert!(parse_split_routes(out, "utun225").is_empty());
+    }
+
+    fn dns(service: &str, servers: &[&str]) -> DnsBackup {
+        DnsBackup { service: service.into(), servers: servers.iter().map(|s| s.to_string()).collect() }
+    }
+
+    #[test]
+    fn dns_backup_current_format() {
+        let json = serde_json::to_vec_pretty(&vec![dns("Wi-Fi", &["1.1.1.1", "fe80::1"]), dns("USB LAN", &[])]).unwrap();
+        let got = parse_dns_backup(&json).unwrap();
+        assert_eq!(got, vec![dns("Wi-Fi", &["1.1.1.1", "fe80::1"]), dns("USB LAN", &[])]);
+        assert!(parse_dns_backup(b"[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn dns_backup_legacy_formats() {
+        // single object, map of service -> servers, null / string / missing servers
+        assert_eq!(
+            parse_dns_backup(br#"{"service":"Wi-Fi","servers":["8.8.8.8"]}"#).unwrap(),
+            vec![dns("Wi-Fi", &["8.8.8.8"])]
+        );
+        let mut m = parse_dns_backup(br#"{"Wi-Fi":["8.8.8.8","8.8.4.4"],"Ethernet":null,"Dock":"9.9.9.9"}"#).unwrap();
+        m.sort_by(|a, b| a.service.cmp(&b.service));
+        assert_eq!(m, vec![dns("Dock", &["9.9.9.9"]), dns("Ethernet", &[]), dns("Wi-Fi", &["8.8.8.8", "8.8.4.4"])]);
+        assert_eq!(
+            parse_dns_backup(br#"[{"service":"A","servers":null},{"service":"B"}]"#).unwrap(),
+            vec![dns("A", &[]), dns("B", &[])]
+        );
+    }
+
+    #[test]
+    fn dns_backup_rejects_garbage_and_hostile_entries() {
+        assert!(parse_dns_backup(b"").is_err());
+        assert!(parse_dns_backup(b"{\"service\":\"Wi-Fi\",\"serv").is_err()); // truncated write
+        assert!(parse_dns_backup(b"42").is_err());
+        assert!(parse_dns_backup(br#"[{"servers":["1.1.1.1"]}]"#).is_err());
+        assert!(parse_dns_backup(br#"[{"service":"-setdnsservers","servers":[]}]"#).is_err());
+        assert!(parse_dns_backup(br#"{"Wi-Fi":{"x":1}}"#).is_err());
+        // non-address strings never reach networksetup
+        assert_eq!(
+            parse_dns_backup(br#"[{"service":"Wi-Fi","servers":["1.1.1.1","-x","evil.example"]}]"#).unwrap(),
+            vec![dns("Wi-Fi", &["1.1.1.1"])]
+        );
+    }
+
+    #[test]
+    fn dns_restore_without_backup_is_noop_and_corrupt_backup_is_moved_aside() {
+        let dir = std::env::temp_dir().join(format!("veil-dnsbk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("dns-backup.json");
+        assert!(!dns_restore(&p).unwrap());
+        std::fs::write(&p, b"{not json").unwrap();
+        assert!(!dns_restore(&p).unwrap());
+        assert!(!p.exists());
+        assert!(dir.join("dns-backup.json.corrupt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_backup_is_atomic_and_overwrites() {
+        let dir = std::env::temp_dir().join(format!("veil-wb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("b.json");
+        write_backup(&p, b"one").unwrap();
+        write_backup(&p, b"two").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"two");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1); // no .tmp left
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

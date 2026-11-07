@@ -198,7 +198,9 @@ impl Engine {
             Some(opts) => match Tun::start(shared_for_tun, opts, &config.server).await {
                 Ok(t) => Some(t),
                 Err(e) => {
+                    // Wait until the listener is really closed, so a retry can bind the port again.
                     task.abort();
+                    let _ = task.await;
                     return Err(e);
                 }
             },
@@ -261,5 +263,72 @@ impl Drop for Engine {
     fn drop(&mut self) {
         self.abort_warm_up();
         self.task.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn counted_counts_upload_and_download() {
+        let stats = Stats::default();
+        let (near, mut far) = tokio::io::duplex(64);
+        let mut counted = Counted { inner: near, stats: &stats };
+
+        counted.write_all(b"hello").await.unwrap();
+        let mut got = [0u8; 5];
+        far.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"hello");
+        assert_eq!((stats.upload.load(Ordering::Relaxed), stats.download.load(Ordering::Relaxed)), (5, 0));
+
+        far.write_all(b"0123456789").await.unwrap();
+        let mut got = [0u8; 10];
+        counted.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"0123456789");
+        assert_eq!((stats.upload.load(Ordering::Relaxed), stats.download.load(Ordering::Relaxed)), (5, 10));
+    }
+
+    /// A pipe that takes 4 bytes at a time accepts a write in pieces and returns `Pending`
+    /// in between: only the bytes actually written may be counted, each exactly once.
+    #[tokio::test]
+    async fn counted_handles_partial_writes() {
+        let stats = Stats::default();
+        let (near, mut far) = tokio::io::duplex(4);
+        let mut counted = Counted { inner: near, stats: &stats };
+        let reader = tokio::spawn(async move {
+            let mut got = vec![0u8; 100];
+            far.read_exact(&mut got).await.unwrap();
+            got
+        });
+        counted.write_all(&[7u8; 100]).await.unwrap();
+        assert_eq!(reader.await.unwrap(), vec![7u8; 100]);
+        assert_eq!(stats.upload.load(Ordering::Relaxed), 100);
+        assert_eq!(stats.download.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn counted_relays_both_ways() {
+        let stats = Stats::default();
+        let (mut client, inbound) = tokio::io::duplex(1024);
+        let (remote, mut server) = tokio::io::duplex(1024);
+        let mut inbound = inbound;
+        let relay = async {
+            let mut counted = Counted { inner: remote, stats: &stats };
+            copy_bidirectional(&mut inbound, &mut counted).await.unwrap();
+        };
+        let peers = async {
+            client.write_all(b"ping").await.unwrap();
+            let mut b = [0u8; 4];
+            server.read_exact(&mut b).await.unwrap();
+            server.write_all(b"pong!!").await.unwrap();
+            let mut c = [0u8; 6];
+            client.read_exact(&mut c).await.unwrap();
+            drop(client);
+            drop(server);
+        };
+        tokio::join!(relay, peers);
+        assert_eq!(stats.upload.load(Ordering::Relaxed), 4);
+        assert_eq!(stats.download.load(Ordering::Relaxed), 6);
     }
 }
