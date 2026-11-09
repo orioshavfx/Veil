@@ -8,4 +8,4 @@ pub mod router;
 pub mod rules;
 pub mod tun;
 
-pub use engine::{Engine, EngineConfig, Stats};
+pub use engine::{Engine, EngineConfig, Stats, note_panic};

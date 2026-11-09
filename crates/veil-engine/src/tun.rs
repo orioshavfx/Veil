@@ -10,6 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -162,6 +163,53 @@ pub(crate) struct Tun {
     scoped_default: bool,
     /// Host routes to proxy servers via the original gateway.
     host_routes: Mutex<Vec<IpAddr>>,
+    /// The packet loop ended on its own (device error): nothing is tunnelled any more.
+    dead: Arc<AtomicBool>,
+    /// Our NRPT rule is (or may be) in the system and has to be removed.
+    #[cfg(windows)]
+    nrpt: Arc<AtomicBool>,
+}
+
+/// The decisions around the Windows NRPT rule, kept free of I/O. The rule sends every DNS
+/// name to our resolver and is stored in the registry, so it outlives a crashed process:
+/// with nobody answering on [`DNS_ADDR`] it takes the whole system's DNS down. Hence the
+/// TUN does not start at all unless the resolver answers a probe (before any route or DNS
+/// setting), and the rule is checked once added.
+#[cfg(any(windows, test))]
+mod nrpt {
+    use veil_proto::dns;
+
+    use super::FakeIp;
+
+    /// Name asked for by the probe; any name gets a fake address.
+    pub const PROBE_NAME: &str = "example.com";
+
+    /// The DNS probe in `bring_up`: one query per entry, each waiting that long for the
+    /// answer. Growing pauses, about 14 s in all: a first start may still be installing the
+    /// driver, and a fresh address can stay unusable for a moment.
+    pub const PROBE_WAITS: [std::time::Duration; 7] = [
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_millis(1000),
+        std::time::Duration::from_millis(1500),
+        std::time::Duration::from_millis(2000),
+        std::time::Duration::from_millis(3000),
+        std::time::Duration::from_millis(3000),
+        std::time::Duration::from_millis(3000),
+    ];
+
+    pub fn probe_total() -> std::time::Duration {
+        PROBE_WAITS.iter().sum()
+    }
+
+    /// Whether `resp` is our fake-IP resolver's answer to the probe query `id`.
+    pub fn probe_answered(id: u16, resp: &[u8]) -> bool {
+        dns::parse_answers(resp, id).is_some_and(|(ips, _)| ips.iter().any(|ip| FakeIp::is_fake(*ip)))
+    }
+
+    /// The probe query: an A question for [`PROBE_NAME`].
+    pub fn probe_query(id: u16) -> Vec<u8> {
+        dns::build_query(id, PROBE_NAME, dns::TYPE_A)
+    }
 }
 
 impl Tun {
@@ -170,6 +218,12 @@ impl Tun {
         if unsafe { libc::geteuid() } != 0 {
             anyhow::bail!("TUN mode needs root: run with sudo");
         }
+        // One TUN setup or cleanup at a time across processes (Windows): the guard of a
+        // dead run must not clean up under a new start, nor read a half-written journal.
+        #[cfg(windows)]
+        let _setup_lock = blocking(veil_sysproxy::tun_setup_lock).await?;
+        // A panic before this TUN existed says nothing about it.
+        crate::engine::TUN_PANICKED.store(false, Ordering::SeqCst);
         // Undo leftovers of a run that crashed before touching anything else.
         let backup = opts.dns_backup.clone();
         blocking(move || veil_sysproxy::dns_restore(&backup)).await??;
@@ -187,7 +241,13 @@ impl Tun {
 
         let result = Self::bring_up(shared, &opts, phys, gateway).await;
         if let Ok(tun) = &result {
+            // From here on the system depends on this process: have someone watch it.
+            #[cfg(windows)]
+            veil_sysproxy::spawn_tun_guard();
             tun.server_changed(server).await;
+            // Last, with the stack running and the server reachable around the tunnel.
+            #[cfg(windows)]
+            tun.enable_nrpt().await;
         }
         if result.is_err() {
             dial::set_bypass(None);
@@ -198,44 +258,23 @@ impl Tun {
     }
 
     async fn bring_up(shared: Arc<Shared>, opts: &TunOptions, phys: String, gateway: Option<IpAddr>) -> Result<Self> {
-        let dev = DeviceBuilder::new()
+        let builder = DeviceBuilder::new();
+        // A fixed alias: cleanup and veil-rescue.ps1 recognise our adapter by it (and its address).
+        #[cfg(windows)]
+        let builder = builder.name(veil_sysproxy::TUN_ADAPTER_NAME);
+        let dev = builder
             .ipv4(TUN_ADDR, TUN_PREFIX, None)
             .ipv6(TUN_ADDR6, 64)
             .mtu(opts.mtu)
             .build_async()
             .context("cannot create TUN device (on Windows: run as administrator, wintun.dll next to the exe)")?;
         let name = dev.name()?;
-        // Keep our own sockets (pinned to the physical interface) routable once
-        // the split routes send everything else into the tunnel.
-        let scoped_default = match gateway {
-            Some(gw) if opts.routes != TunRoutes::Domains => {
-                let phys = phys.clone();
-                blocking(move || veil_sysproxy::add_scoped_default(&phys, gw)).await?
-            }
-            _ => false,
-        };
-        let undo = || undo_routes(name.clone(), phys.clone(), scoped_default);
-        let routes = opts.routes;
-        let n = name.clone();
-        if let Err(e) = blocking(move || veil_sysproxy::add_tun_routes(&n, routes)).await.and_then(|r| r) {
-            undo().await;
-            return Err(e);
-        }
-        let backup = opts.dns_backup.clone();
-        if let Err(e) = blocking(move || veil_sysproxy::dns_override(&[IpAddr::V4(DNS_ADDR)], &backup))
-            .await
-            .and_then(|r| r)
-        {
-            undo().await;
-            return Err(e);
-        }
-        tracing::info!("TUN {name} up ({:?})", opts.routes);
 
+        // The packet stack goes first: nothing in the system points at the device yet, so
+        // a failure up to the end of the DNS probe leaves nothing behind but the adapter,
+        // which disappears with `dev`.
         let mut cfg = IpStackConfig::default();
-        if let Err(e) = cfg.mtu(opts.mtu) {
-            undo().await;
-            return Err(anyhow::anyhow!("{e:?}"));
-        }
+        cfg.mtu(opts.mtu).map_err(|e| anyhow::anyhow!("{e:?}"))?;
         cfg.udp_timeout(UDP_IDLE);
         // The default 60 s idle timeout kills quiet HTTP/2 and websocket connections.
         let mut tcp = ipstack::TcpConfig::default();
@@ -243,7 +282,16 @@ impl Tun {
         cfg.with_tcp_config(tcp);
         let mut stack = IpStack::new(cfg, TunIo(dev));
         let fake = Arc::new(FakeIp::new());
-        let task = tokio::spawn(async move {
+        let dead = Arc::new(AtomicBool::new(false));
+        let dead_flag = dead.clone();
+        #[cfg(windows)]
+        let nrpt = Arc::new(AtomicBool::new(false));
+        #[cfg(windows)]
+        let (nrpt_flag, name_for_task) = (nrpt.clone(), name.clone());
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut task = tokio::spawn(async move {
+            // A panic in the loop ends it without reaching the code below: mark it dead anyway.
+            let _unwind = DeadOnUnwind(dead_flag.clone());
             loop {
                 match stack.accept().await {
                     Ok(IpStackStream::Tcp(tcp)) => {
@@ -269,7 +317,80 @@ impl Tun {
                     }
                 }
             }
+            // Nobody answers DNS or forwards packets any more. Take out what would now
+            // black-hole the system (the NRPT rule first, then the routes into the dead
+            // adapter); the owner sees `is_dead` and does the rest of the teardown.
+            dead_flag.store(true, Ordering::SeqCst);
+            #[cfg(windows)]
+            {
+                let had_nrpt = nrpt_flag.swap(false, Ordering::SeqCst);
+                let _ = tokio::task::spawn_blocking(move || {
+                    if had_nrpt && let Err(e) = veil_sysproxy::nrpt_disable_fast() {
+                        tracing::error!("{e:#}");
+                    }
+                    veil_sysproxy::remove_tun_routes(&name_for_task);
+                })
+                .await;
+            }
         });
+
+        // Hard condition (Windows): our resolver answers on DNS_ADDR before any route, DNS
+        // setting or NRPT rule points the system at it. DNS_ADDR is reachable already through
+        // the adapter's own on-link /15, so this changes nothing in the system. First the
+        // adapter has to be there with a usable address (a first start may be installing the
+        // driver; IPv4 duplicate address detection keeps it Tentative for a moment).
+        #[cfg(windows)]
+        {
+            let n = name.clone();
+            let ready = blocking(move || veil_sysproxy::wait_tun_address(&n)).await.and_then(|r| r);
+            if let Err(e) = &ready {
+                tracing::warn!("TUN adapter not ready: {e:#}; probing the resolver anyway");
+            }
+            if !probe_dns().await {
+                task.abort();
+                let _ = (&mut task).await;
+                let state = ready.err().map_or(String::new(), |e| format!(" ({e:#})"));
+                anyhow::bail!(
+                    "the TUN resolver {DNS_ADDR} did not answer within {} s{state}; nothing in the system was changed. \
+                     A third-party firewall blocking the Veil adapter, or another VPN/TUN using 198.18.0.0/15, can cause this",
+                    nrpt::probe_total().as_secs()
+                );
+            }
+        }
+
+        // Keep our own sockets (pinned to the physical interface) routable once
+        // the split routes send everything else into the tunnel.
+        let scoped_default = match gateway {
+            Some(gw) if opts.routes != TunRoutes::Domains => {
+                let phys = phys.clone();
+                match blocking(move || veil_sysproxy::add_scoped_default(&phys, gw)).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        task.abort();
+                        return Err(e);
+                    }
+                }
+            }
+            _ => false,
+        };
+        let undo = || undo_routes(name.clone(), phys.clone(), scoped_default);
+        let routes = opts.routes;
+        let n = name.clone();
+        if let Err(e) = blocking(move || veil_sysproxy::add_tun_routes(&n, routes)).await.and_then(|r| r) {
+            task.abort();
+            undo().await;
+            return Err(e);
+        }
+        let backup = opts.dns_backup.clone();
+        if let Err(e) = blocking(move || veil_sysproxy::dns_override(&[IpAddr::V4(DNS_ADDR)], &backup))
+            .await
+            .and_then(|r| r)
+        {
+            task.abort();
+            undo().await;
+            return Err(e);
+        }
+        tracing::info!("TUN {name} up ({:?})", opts.routes);
         Ok(Self {
             name,
             task,
@@ -278,7 +399,57 @@ impl Tun {
             gateway,
             scoped_default,
             host_routes: Mutex::new(Vec::new()),
+            dead,
+            #[cfg(windows)]
+            nrpt,
         })
+    }
+
+    /// True once the packet loop has ended on its own: the tunnel no longer works and
+    /// the owner should stop it and report "disconnected".
+    pub(crate) fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::SeqCst)
+    }
+
+    /// Adds the NRPT rule (our resolver has answered the probe in `bring_up` by now) and
+    /// takes it out again if the system resolver does not work with it. Never fails the
+    /// start: without the rule names may leak to the physical adapters' DNS, but DNS works.
+    #[cfg(windows)]
+    async fn enable_nrpt(&self) {
+        // Set before the rule exists, so that every exit path tries to remove it.
+        self.nrpt.store(true, Ordering::SeqCst);
+        let added = blocking(|| veil_sysproxy::nrpt_enable(&[IpAddr::V4(DNS_ADDR)])).await.and_then(|r| r);
+        let keep = match added {
+            Ok(()) => {
+                let ok = blocking(veil_sysproxy::system_resolver_works).await.unwrap_or(false);
+                if !ok {
+                    tracing::warn!("the system resolver does not work with the NRPT rule: removing it, DNS names may leak through other adapters");
+                }
+                ok
+            }
+            Err(e) => {
+                tracing::warn!("NRPT rule not added, DNS names may leak through other adapters: {e:#}");
+                false
+            }
+        };
+        if keep {
+            tracing::info!("NRPT rule verified: the system resolver answers through the tunnel");
+        } else {
+            self.disable_nrpt().await;
+        }
+    }
+
+    /// Removes the NRPT rule if it may be there. On failure the flag stays set, so the
+    /// next exit path (`stop`, `Drop`) tries again.
+    #[cfg(windows)]
+    async fn disable_nrpt(&self) {
+        if !self.nrpt.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        if let Err(e) = blocking(veil_sysproxy::nrpt_disable).await.and_then(|r| r) {
+            tracing::error!("{e:#}");
+            self.nrpt.store(true, Ordering::SeqCst);
+        }
     }
 
     /// Routes the (new) proxy server's address around the tunnel.
@@ -324,11 +495,17 @@ impl Tun {
         }
     }
 
-    pub(crate) async fn stop(self) {
+    pub(crate) async fn stop(mut self) {
+        // First the one setting that outlives the adapter and breaks DNS for the whole
+        // system if anything below hangs or the process dies half-way.
+        #[cfg(windows)]
+        self.disable_nrpt().await;
         self.task.abort();
-        let _ = self.task.await;
+        let _ = (&mut self.task).await;
         let host_routes: Vec<IpAddr> = self.host_routes.lock().unwrap().drain(..).collect();
-        let Self { name, phys, gateway, scoped_default, dns_backup, .. } = self;
+        // `Tun` implements `Drop` on Windows, so its fields cannot be moved out.
+        let (name, phys, dns_backup) = (self.name.clone(), self.phys.clone(), self.dns_backup.clone());
+        let (gateway, scoped_default) = (self.gateway, self.scoped_default);
         let name_log = name.clone();
         let res = blocking(move || {
             veil_sysproxy::remove_tun_routes(&name);
@@ -348,6 +525,69 @@ impl Tun {
         }
         dial::set_bypass(None);
         tracing::info!("TUN {name_log} down");
+    }
+}
+
+/// Dropped without [`Tun::stop`] (an error path, a cancelled task): the NRPT rule must not
+/// be left behind. Synchronous on purpose, there is no later moment to do it.
+#[cfg(windows)]
+impl Drop for Tun {
+    fn drop(&mut self) {
+        self.task.abort();
+        if self.nrpt.swap(false, Ordering::SeqCst)
+            && let Err(e) = veil_sysproxy::nrpt_disable_fast()
+        {
+            tracing::error!("{e:#}");
+        }
+    }
+}
+
+/// Asks our resolver on [`DNS_ADDR`] for an A record, the way any program would, on the
+/// schedule [`nrpt::PROBE_WAITS`]. True when the fake-IP answer came back.
+#[cfg(windows)]
+async fn probe_dns() -> bool {
+    probe_dns_at(SocketAddr::new(IpAddr::V4(DNS_ADDR), 53), &nrpt::PROBE_WAITS).await
+}
+
+/// One query per entry of `waits`, each waiting that long for the answer (late answers
+/// to an earlier query count too: same id).
+#[cfg(any(windows, test))]
+async fn probe_dns_at(server: SocketAddr, waits: &[Duration]) -> bool {
+    let id = (std::process::id() as u16) ^ 0x5a5a;
+    let query = nrpt::probe_query(id);
+    let bind = if server.is_ipv4() { SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)) } else { SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)) };
+    let Ok(sock) = tokio::net::UdpSocket::bind(bind).await else { return false };
+    if sock.connect(server).await.is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 1500];
+    for wait in waits {
+        let deadline = tokio::time::Instant::now() + *wait;
+        if sock.send(&query).await.is_err() {
+            // The fresh adapter may not be ready yet: wait out this try, then send again.
+            tokio::time::sleep_until(deadline).await;
+            continue;
+        }
+        // A stray or failed read (e.g. ICMP unreachable) is not an answer: keep waiting.
+        while let Ok(r) = tokio::time::timeout_at(deadline, sock.recv(&mut buf)).await {
+            match r {
+                Ok(n) if nrpt::probe_answered(id, &buf[..n]) => return true,
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    }
+    false
+}
+
+/// Sets the flag when dropped while unwinding a panic (and only then).
+struct DeadOnUnwind(Arc<AtomicBool>);
+
+impl Drop for DeadOnUnwind {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -473,6 +713,81 @@ mod tests {
             Some(Address::Domain("a.com".into(), 443))
         );
         assert_eq!(target(&f, SocketAddr::new(Ipv4Addr::new(198, 18, 9, 9).into(), 1)), None);
+    }
+
+    #[tokio::test]
+    async fn nrpt_probe_and_decisions() {
+        // The probe query, answered by our own resolver code, counts as an answer.
+        let f = FakeIp::new();
+        let q = nrpt::probe_query(0x1234);
+        let resp = answer_dns(&f, &q).await.unwrap();
+        assert!(nrpt::probe_answered(0x1234, &resp));
+        // Wrong id, a query echoed back, garbage, an empty answer or a real address do not.
+        assert!(!nrpt::probe_answered(0x1235, &resp));
+        assert!(!nrpt::probe_answered(0x1234, &q));
+        assert!(!nrpt::probe_answered(0x1234, b"junk"));
+        assert!(!nrpt::probe_answered(0x1234, &[]));
+        let parsed = dns::parse_question(&q).unwrap();
+        let empty = dns::build_response(&q, &parsed, &[], 60);
+        assert!(!nrpt::probe_answered(0x1234, &empty));
+        let real = dns::build_response(&q, &parsed, &[IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))], 60);
+        assert!(!nrpt::probe_answered(0x1234, &real));
+        // The schedule: growing pauses, 12-15 s in all.
+        assert!(nrpt::PROBE_WAITS.windows(2).all(|w| w[0] <= w[1]));
+        assert!(nrpt::PROBE_WAITS[0] < nrpt::PROBE_WAITS[nrpt::PROBE_WAITS.len() - 1]);
+        let total = nrpt::probe_total();
+        assert!(total >= Duration::from_secs(12) && total <= Duration::from_secs(15), "{total:?}");
+    }
+
+    /// A resolver that ignores the first `ignore` queries, then answers like ours; counts queries.
+    async fn flaky_resolver(ignore: usize) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = seen.clone();
+        tokio::spawn(async move {
+            let fake = FakeIp::new();
+            let mut buf = [0u8; 1500];
+            while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+                if count.fetch_add(1, Ordering::SeqCst) < ignore {
+                    continue;
+                }
+                if let Some(resp) = answer_dns(&fake, &buf[..n]).await {
+                    let _ = sock.send_to(&resp, from).await;
+                }
+            }
+        });
+        (addr, seen)
+    }
+
+    #[tokio::test]
+    async fn probe_retries_until_answered() {
+        let ms = Duration::from_millis;
+        // Not ready for the first two tries: the third one gets through.
+        let (addr, seen) = flaky_resolver(2).await;
+        assert!(probe_dns_at(addr, &[ms(100), ms(150), ms(400), ms(400)]).await);
+        assert_eq!(seen.load(Ordering::SeqCst), 3, "one query per try, none after the answer");
+        // Never answers: false, after exactly one query per entry of the schedule.
+        let (addr, seen) = flaky_resolver(usize::MAX).await;
+        let started = tokio::time::Instant::now();
+        assert!(!probe_dns_at(addr, &[ms(50), ms(100), ms(150)]).await);
+        assert_eq!(seen.load(Ordering::SeqCst), 3);
+        assert!(started.elapsed() >= ms(300), "the whole schedule is waited out");
+    }
+
+    #[test]
+    fn dead_on_unwind_only() {
+        let flag = Arc::new(AtomicBool::new(false));
+        drop(DeadOnUnwind(flag.clone()));
+        assert!(!flag.load(Ordering::SeqCst), "a normal drop (abort, stop) is not a death");
+        let f = flag.clone();
+        let r = std::thread::spawn(move || {
+            let _g = DeadOnUnwind(f);
+            panic!("test panic");
+        })
+        .join();
+        assert!(r.is_err());
+        assert!(flag.load(Ordering::SeqCst), "a panic marks the loop dead");
     }
 
     #[tokio::test]

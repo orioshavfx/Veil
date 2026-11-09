@@ -355,6 +355,9 @@ mod session_end {
             if let Some(path) = BACKUP.get() {
                 let _ = veil_sysproxy::restore(path);
             }
+            // TUN mode: the DNS (NRPT) rule would survive the reboot with nobody answering.
+            // Straight from the registry: the session is ending, there is no time for PowerShell.
+            veil_sysproxy::tun_cleanup_session_end();
             return 0;
         }
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -474,6 +477,17 @@ fn wait_for_exit(pid: u32, timeout: Duration) {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // An elevated copy started only to remove what a dead TUN session left behind:
+    // no window, no single-instance lock (the normal copy is running and waiting for this).
+    // Only leftovers: a TUN that a running Veil (veil-cli, say) is using stays.
+    if core::wants_tun_cleanup(args.iter().cloned()) {
+        init_logging();
+        match veil_sysproxy::tun_cleanup_if_orphaned() {
+            Some(report) => tracing::info!("--tun-cleanup: removed {:?}, left {:?}", report.removed, report.failed),
+            None => tracing::info!("--tun-cleanup: the TUN is in use by a running Veil, left alone"),
+        }
+        return;
+    }
     let connect_tun = core::wants_connect_tun(args.iter().cloned());
     #[cfg(windows)]
     if let Some(pid) = core::after_pid(args.iter().cloned()) {
@@ -484,6 +498,15 @@ fn main() {
         return;
     }
     init_logging();
+    // A panic must not leave the system pointing at a tunnel that is about to die. The hook
+    // itself touches nothing (any thread, any state): it raises a flag, and the TUN reaper
+    // below disconnects the normal way and shows the error.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        veil_engine::note_panic();
+        tracing::error!("panic: {info}");
+        default_hook(info);
+    }));
     #[cfg(windows)]
     session_end::start();
     tracing::info!("Veil {} starting", env!("CARGO_PKG_VERSION"));
@@ -612,6 +635,28 @@ fn main() {
                 });
             }
 
+            // A TUN whose packet loop died (or a process that panicked) is not to be trusted:
+            // disconnect the normal way and show "disconnected", not a lie.
+            #[cfg(windows)]
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        let changed = {
+                            let state = handle.state::<Mutex<Core>>();
+                            let mut core = state.lock().await;
+                            let reaped = core.reap_dead_tun().await;
+                            core.recheck_tun_leftovers() || reaped
+                        };
+                        if changed {
+                            update_tray(&handle).await;
+                            let _ = tauri::Emitter::emit(&handle, "state-changed", ());
+                        }
+                    }
+                });
+            }
+
             // Started elevated by the app itself (Windows TUN): connect right away.
             if connect_tun {
                 let handle = app.handle().clone();
@@ -670,6 +715,9 @@ fn main() {
                     Ok(mut c) => c.disconnect().await,
                     Err(_) => tracing::error!("exit: core busy for 10 s, quitting anyway"),
                 }
+                // Whatever happened above (a busy core, a teardown that failed half-way):
+                // never quit with our TUN changes still in the system. Needs no core.
+                let _ = tokio::task::spawn_blocking(veil_sysproxy::tun_cleanup_own).await;
                 CLEANED_UP.store(true, std::sync::atomic::Ordering::SeqCst);
                 app.exit(0);
             });

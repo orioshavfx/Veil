@@ -11,4 +11,4 @@ serde_json.workspace = true
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinInet"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinInet", "Win32_Security", "Win32_System_Registry", "Win32_System_Threading"] }

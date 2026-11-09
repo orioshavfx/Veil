@@ -137,7 +137,28 @@ impl Core {
         }
         // Leftovers of a crash: put the user's proxy settings back.
         let _ = veil_sysproxy::restore(&store.dir().join("sysproxy-backup.json"));
-        Ok(Self { store, state, conn: None, connected_at: None, last_error: None, relaunch: false, no_relaunch: false, elevated_started: false })
+        // Leftovers of a TUN session that died (Windows): above all the DNS (NRPT) rule,
+        // which breaks name resolution for the whole system, this app's Proxy mode
+        // included. Runs in a normal, non-elevated start too; a no-op elsewhere.
+        // A cheap look first (journal file, registry): PowerShell only when there is a sign.
+        let mut last_error = None;
+        if veil_sysproxy::tun_leftovers_suspected()
+            && let Some(report) = veil_sysproxy::tun_cleanup_if_orphaned()
+            && !report.failed.is_empty()
+        {
+            tracing::warn!("TUN leftovers could not be removed (needs admin: {}): {:?}", report.needs_admin, report.failed);
+            last_error = Some(tun_leftover_msg(report.needs_admin).to_string());
+            // Ask for the rights right away: an elevated copy removes the rule and exits.
+            #[cfg(windows)]
+            if report.needs_admin {
+                std::thread::spawn(|| {
+                    if let Err(e) = win::run_elevated_cleanup() {
+                        tracing::warn!("{e:#}");
+                    }
+                });
+            }
+        }
+        Ok(Self { store, state, conn: None, connected_at: None, last_error, relaunch: false, no_relaunch: false, elevated_started: false })
     }
 
     fn save(&self) -> Result<()> {
@@ -606,6 +627,32 @@ impl Core {
         tracing::info!("disconnected");
     }
 
+    /// Clears the "TUN leftovers" error once they are gone (removed by the elevated copy,
+    /// by veil-rescue.ps1 or by hand). Cheap: no PowerShell. True when the error was cleared.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn recheck_tun_leftovers(&mut self) -> bool {
+        let shown = self.last_error.as_deref().is_some_and(|e| e == tun_leftover_msg(true) || e == tun_leftover_msg(false));
+        if shown && self.conn.is_none() && !veil_sysproxy::tun_leftovers_suspected() {
+            tracing::info!("TUN leftovers are gone");
+            self.last_error = None;
+            return true;
+        }
+        false
+    }
+
+    /// Disconnects when the TUN packet loop has died on its own, so the UI stops showing
+    /// a tunnel that carries nothing. True when that happened.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub async fn reap_dead_tun(&mut self) -> bool {
+        let dead = matches!(&self.conn, Some(Conn::Proxy { engine, .. }) if engine.tun_failed());
+        if dead {
+            tracing::error!("the TUN tunnel stopped on its own: disconnecting");
+            self.disconnect().await;
+            self.last_error = Some("The TUN tunnel stopped unexpectedly and Veil disconnected. Connect again.".into());
+        }
+        dead
+    }
+
     /// What `traffic()` needs, taken under the lock so the query runs without it.
     pub fn traffic_source(&self) -> TrafficSource {
         let seconds = self.connected_at.map_or(0, |t| t.elapsed().as_secs());
@@ -711,30 +758,41 @@ mod win {
 
     /// Starts this exe again through the UAC prompt, asking it to connect in TUN mode.
     pub fn relaunch_elevated() -> Result<()> {
+        // The new copy waits for this process to exit before it opens its WebView
+        // (the user data folder cannot be shared between elevation levels).
+        let args = format!("{} {}={}", super::CONNECT_TUN_ARG, super::AFTER_PID_ARG, std::process::id());
+        match run_as_admin(&args)? {
+            c if c > 32 => Ok(()),
+            // SE_ERR_ACCESSDENIED: the UAC prompt was declined.
+            5 => bail!("Administrator permission was declined; TUN mode cannot start without it"),
+            c => bail!("could not restart Veil as administrator (error {c})"),
+        }
+    }
+
+    /// Starts an elevated copy of this exe that only removes what a dead TUN session
+    /// left behind (`--tun-cleanup`) and exits. Blocks until the UAC prompt is answered.
+    pub fn run_elevated_cleanup() -> Result<()> {
+        match run_as_admin(super::TUN_CLEANUP_ARG)? {
+            c if c > 32 => Ok(()),
+            5 => bail!("Administrator permission was declined; the leftover DNS rule is still there"),
+            c => bail!("could not start the cleanup as administrator (error {c})"),
+        }
+    }
+
+    /// `ShellExecuteW` with the `runas` verb on this exe; returns its result code.
+    fn run_as_admin(args: &str) -> Result<isize> {
         let exe = std::env::current_exe().context("cannot find Veil.exe")?;
         let wide = |s: &std::ffi::OsStr| s.encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
         let verb = wide(std::ffi::OsStr::new("runas"));
         let file = wide(exe.as_os_str());
-        // The new copy waits for this process to exit before it opens its WebView
-        // (the user data folder cannot be shared between elevation levels).
-        let args = wide(std::ffi::OsStr::new(&format!(
-            "{} {}={}",
-            super::CONNECT_TUN_ARG,
-            super::AFTER_PID_ARG,
-            std::process::id()
-        )));
+        let args = wide(std::ffi::OsStr::new(args));
         // An elevated start would otherwise use System32 as the working directory.
         let dir = exe.parent().map(|d| wide(d.as_os_str()));
         let dir_ptr = dir.as_ref().map_or(std::ptr::null(), |d| d.as_ptr());
         let code = unsafe {
             ShellExecuteW(null_mut(), verb.as_ptr(), file.as_ptr(), args.as_ptr(), dir_ptr, SW_SHOWNORMAL)
         } as isize;
-        match code {
-            c if c > 32 => Ok(()),
-            // SE_ERR_ACCESSDENIED: the UAC prompt was declined.
-            5 => bail!("Administrator permission was declined; TUN mode cannot start without it"),
-            c => bail!("could not restart Veil as administrator (error {c})"),
-        }
+        Ok(code)
     }
 
     /// tun-rs loads wintun.dll from the folder of the exe.
@@ -750,6 +808,27 @@ mod win {
 
 /// Command-line flag of the elevated copy: connect in TUN mode as soon as the UI is up.
 pub const CONNECT_TUN_ARG: &str = "--connect-tun";
+
+/// Command-line flag: remove what a dead TUN session left in the system, then exit.
+/// Used for the elevated copy started when the normal one lacks the rights.
+pub const TUN_CLEANUP_ARG: &str = "--tun-cleanup";
+
+/// Shown when leftovers of a TUN session could not be removed: for lack of administrator
+/// rights (`needs_admin`) or for another reason.
+fn tun_leftover_msg(needs_admin: bool) -> &'static str {
+    if needs_admin {
+        "A DNS rule left by an earlier TUN session is still in Windows and can break name resolution. \
+         Approve the administrator prompt to remove it, or run veil-rescue.ps1 from the Veil folder, then restart Veil."
+    } else {
+        "Settings left by an earlier TUN session could not be removed and can break name resolution. \
+         Run veil-rescue.ps1 from the Veil folder (it writes a report to veil-rescue.txt), then restart Veil."
+    }
+}
+
+/// Whether the command line (without the program name) asks for `--tun-cleanup`.
+pub fn wants_tun_cleanup<I: IntoIterator<Item = String>>(args: I) -> bool {
+    args.into_iter().any(|a| a == TUN_CLEANUP_ARG)
+}
 
 /// Command-line flag of the elevated copy: `--after-pid=N`, wait for process N (the copy
 /// that started us) to exit before touching the WebView.
@@ -787,10 +866,17 @@ fn helper_binary() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod arg_tests {
-    use super::{after_pid, wants_connect_tun};
+    use super::{after_pid, wants_connect_tun, wants_tun_cleanup};
 
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn tun_cleanup_flag() {
+        assert!(wants_tun_cleanup(args(&["--tun-cleanup"])));
+        assert!(!wants_tun_cleanup(args(&[])));
+        assert!(!wants_tun_cleanup(args(&["--connect-tun", "tun-cleanup", "--tun-cleanup=1"])));
     }
 
     #[test]

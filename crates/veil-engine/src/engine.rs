@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use std::time::Duration;
@@ -159,6 +159,16 @@ pub struct Engine {
     warm_up: std::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
+/// Set by the panic hook of the app or the CLI ([`note_panic`]); cleared when a TUN starts.
+pub(crate) static TUN_PANICKED: AtomicBool = AtomicBool::new(false);
+
+/// For a panic hook: records that the process panicked, without touching the system (the
+/// hook may run on any thread, in any state). A running TUN then reports
+/// [`Engine::tun_failed`] and its owner stops it with the normal teardown.
+pub fn note_panic() {
+    TUN_PANICKED.store(true, Ordering::SeqCst);
+}
+
 impl Engine {
     pub async fn start(config: EngineConfig) -> Result<Self> {
         let outbound: Arc<dyn veil_proto::Outbound> =
@@ -235,6 +245,16 @@ impl Engine {
 
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// True when TUN mode was on and its packet loop has ended on its own (device error), or
+    /// (Windows) a panic happened anywhere in the process since the TUN started (see
+    /// [`note_panic`]): the tunnel cannot be trusted any more, the engine should be stopped
+    /// the normal way. Elsewhere a panic alone does not end the TUN: it leaves nothing
+    /// behind in the system that would outlive the process.
+    pub fn tun_failed(&self) -> bool {
+        let panicked = cfg!(windows) && TUN_PANICKED.load(Ordering::SeqCst);
+        self.tun.as_ref().is_some_and(|t| t.is_dead() || panicked)
     }
 
     pub fn stats(&self) -> &Arc<Stats> {

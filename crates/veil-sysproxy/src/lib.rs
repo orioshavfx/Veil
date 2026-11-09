@@ -29,6 +29,52 @@ impl TunRoutes {
     }
 }
 
+/// Name (interface alias) of the Windows TUN adapter. Cleanup touches only an adapter
+/// with this alias that also has the TUN address 198.18.0.1.
+pub const TUN_ADAPTER_NAME: &str = "Veil";
+
+/// What [`tun_cleanup`] found and did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CleanupReport {
+    /// Something of ours is still there and removing it takes administrator rights.
+    pub needs_admin: bool,
+    /// What was removed.
+    pub removed: Vec<String>,
+    /// What was found but could not be removed, with the reason.
+    pub failed: Vec<String>,
+}
+
+impl CleanupReport {
+    pub fn is_empty(&self) -> bool {
+        self.removed.is_empty() && self.failed.is_empty()
+    }
+}
+
+/// Nothing outlives the process here: the routes and DNS settings are tied to the utun
+/// device and restored by `dns_restore`.
+#[cfg(not(windows))]
+pub fn tun_cleanup() -> CleanupReport {
+    CleanupReport::default()
+}
+
+/// See the Windows version; nothing to do elsewhere.
+#[cfg(not(windows))]
+pub fn tun_cleanup_if_orphaned() -> Option<CleanupReport> {
+    None
+}
+
+/// See the Windows version; nothing to do elsewhere.
+#[cfg(not(windows))]
+pub fn tun_cleanup_own() -> Option<CleanupReport> {
+    None
+}
+
+/// See the Windows version; nothing to do elsewhere.
+#[cfg(not(windows))]
+pub fn tun_leftovers_suspected() -> bool {
+    false
+}
+
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]

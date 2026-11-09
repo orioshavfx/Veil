@@ -4,9 +4,10 @@ What works: the Veil app (window + tray icon), subscriptions, all protocols
 (VLESS/REALITY/Vision, VMess, Trojan, Shadowsocks, Hysteria2), Proxy mode with
 the Windows system proxy, TUN mode, site and app rules.
 
-Files: Veil.exe (the app), veil-cli.exe (command-line tool for the test script),
-wintun.dll (TUN driver, needed for TUN mode), geo\ (site/IP lists).
-Keep them together in one folder.
+Files: Veil.exe (the app), veil-cli.exe (command-line tool: the test script uses it,
+and Veil starts it in TUN mode to clean up if the app dies), wintun.dll (TUN driver,
+needed for TUN mode), geo\ (site/IP lists), veil-rescue.ps1 (puts the network back
+if something went wrong, see step 5). Keep them together in one folder.
 
 1. Unzip this folder anywhere (e.g. Documents\Veil).
 2. Windows may block files downloaded from the internet. In PowerShell, in this folder:
@@ -39,8 +40,15 @@ Keep them together in one folder.
    - Check https://api.ipify.org: it should show the server's IP. The system
      proxy stays off in TUN mode.
    - To undo everything: press the power button again or Quit Veil from the tray.
-     If something went wrong, just close the app (the TUN adapter disappears with it).
      Next time you start Veil normally (no administrator) in Proxy mode.
+   - If the network does not work afterwards (sites do not open, even with Veil
+     closed), run the rescue script in this folder:
+         powershell -ExecutionPolicy Bypass -File .\veil-rescue.ps1
+     It asks for administrator rights, removes only what Veil created (its DNS rule,
+     its routes on the TUN adapter) and can be run any number of times. It writes
+     veil-rescue.txt: please send that file too.
+     The same from an administrator prompt: veil-cli.exe tun-cleanup
 
 6. Send back: veil-report.txt, %LOCALAPPDATA%\Veil\veil.log (paste that path
-   into the Explorer address bar), and a note on anything that looked wrong.
+   into the Explorer address bar), veil-rescue.txt if you ran the rescue script,
+   and a note on anything that looked wrong.

@@ -35,8 +35,19 @@ enum Cmd {
     Route { preset: Option<String> },
     /// Download fresh geoip.dat / geosite.dat.
     GeoUpdate,
-    /// Restore proxy and DNS settings saved before `run` (after a crash).
+    /// Restore proxy and DNS settings saved before `run` (after a crash), and remove
+    /// what a dead TUN session left behind (a TUN in use by a running Veil stays).
     RestoreProxy,
+    /// Remove what a TUN session left in the system (Windows: the DNS/NRPT rule, routes
+    /// and DNS of the TUN adapter), even if a running Veil is using it. Safe to repeat;
+    /// exits with 2 when it needs administrator rights.
+    TunCleanup,
+    /// Internal: wait for process PID to end, then do `tun-cleanup` (started by Veil in TUN mode).
+    #[command(hide = true)]
+    TunGuard {
+        #[arg(long)]
+        pid: u32,
+    },
     /// Install or update the privileged TUN helper (asks for an admin password).
     HelperInstall,
     /// Run the local SOCKS5/HTTP proxy with the selected profile.
@@ -116,6 +127,20 @@ async fn wait_for_shutdown() -> Result<()> {
     Ok(())
 }
 
+/// Prints what `tun_cleanup` did; true when everything of ours is gone.
+fn print_cleanup(report: &veil_sysproxy::CleanupReport) -> bool {
+    for item in &report.removed {
+        println!("removed: {item}");
+    }
+    for item in &report.failed {
+        eprintln!("NOT removed: {item}");
+    }
+    if report.needs_admin {
+        eprintln!("administrator rights are needed: run this again from an elevated prompt (or run veil-rescue.ps1)");
+    }
+    report.failed.is_empty()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -123,7 +148,36 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    // A panic must not leave the system pointing at a tunnel that is about to die. The hook
+    // touches nothing itself: `run` sees the flag and stops the engine the normal way.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        veil_engine::note_panic();
+        default_hook(info);
+    }));
     let cli = Cli::parse();
+    // The rescue commands come first: they must work even when the settings cannot be read.
+    match cli.cmd {
+        Cmd::TunCleanup => {
+            let report = veil_sysproxy::tun_cleanup();
+            let clean = print_cleanup(&report);
+            if report.is_empty() {
+                println!("nothing to clean up");
+            }
+            if !clean {
+                std::process::exit(if report.needs_admin { 2 } else { 1 });
+            }
+            return Ok(());
+        }
+        Cmd::TunGuard { pid } => {
+            #[cfg(windows)]
+            let _ = veil_sysproxy::tun_guard(pid);
+            #[cfg(not(windows))]
+            let _ = pid;
+            return Ok(());
+        }
+        _ => {}
+    }
     let store = Store::open_default()?;
     let mut state = store.load()?;
 
@@ -218,13 +272,33 @@ async fn main() -> Result<()> {
             println!("helper {} installed", veil_helper::VERSION);
         }
         Cmd::RestoreProxy => {
-            let proxy = veil_sysproxy::restore(&proxy_backup(&store))?;
-            let dns = veil_sysproxy::dns_restore(&dns_backup(&store))?;
-            match (proxy, dns) {
-                (false, false) => println!("nothing to restore"),
-                _ => println!("restored:{}{}", if proxy { " proxy" } else { "" }, if dns { " DNS" } else { "" }),
+            // Every step runs even if an earlier one failed, and a failure is never
+            // reported as "nothing to restore".
+            let proxy = veil_sysproxy::restore(&proxy_backup(&store));
+            let dns = veil_sysproxy::dns_restore(&dns_backup(&store));
+            // Only leftovers: a TUN that a running Veil is using stays (`tun-cleanup` forces it).
+            let report = veil_sysproxy::tun_cleanup_if_orphaned().unwrap_or_else(|| {
+                println!("TUN: in use by a running Veil, left alone");
+                veil_sysproxy::CleanupReport::default()
+            });
+            let mut failed = !print_cleanup(&report);
+            for (what, result) in [("proxy", &proxy), ("DNS", &dns)] {
+                if let Err(e) = result {
+                    eprintln!("restoring {what} failed: {e:#}");
+                    failed = true;
+                }
+            }
+            let (proxy, dns) = (proxy.unwrap_or(false), dns.unwrap_or(false));
+            if proxy || dns {
+                println!("restored:{}{}", if proxy { " proxy" } else { "" }, if dns { " DNS" } else { "" });
+            } else if !failed && report.is_empty() {
+                println!("nothing to restore");
+            }
+            if failed {
+                std::process::exit(if report.needs_admin { 2 } else { 1 });
             }
         }
+        Cmd::TunCleanup | Cmd::TunGuard { .. } => unreachable!("handled before the settings are opened"),
         Cmd::Run { port, profile, no_sysproxy, tun } => {
             let backup = proxy_backup(&store);
             if veil_sysproxy::restore(&backup)? {
@@ -265,7 +339,18 @@ async fn main() -> Result<()> {
                 println!("system proxy enabled");
             }
             println!("SOCKS5/HTTP proxy on {listen}, Ctrl+C to stop");
-            wait_for_shutdown().await?;
+            let tun_died = async {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    if engine.tun_failed() {
+                        return;
+                    }
+                }
+            };
+            tokio::select! {
+                r = wait_for_shutdown() => r?,
+                _ = tun_died => eprintln!("the TUN tunnel stopped unexpectedly: shutting down"),
+            }
             if sysproxy {
                 veil_sysproxy::restore(&backup)?;
                 println!("\nsystem proxy restored");
