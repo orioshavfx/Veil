@@ -1,0 +1,20 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "popover",
+  "description": "Menu bar panel (macOS): its own commands, connect/disconnect, mode, server choice, traffic and app events",
+  "windows": ["popover"],
+  "platforms": ["macOS"],
+  "permissions": [
+    "core:event:default",
+    "allow-popover-state",
+    "allow-ping-servers",
+    "allow-hide-popover",
+    "allow-open-main-window",
+    "allow-quit-app",
+    "allow-connect",
+    "allow-disconnect",
+    "allow-set-mode",
+    "allow-select-profile",
+    "allow-traffic"
+  ]
+}

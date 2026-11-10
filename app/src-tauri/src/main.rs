@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod core;
+mod popover;
 
 use std::time::Duration;
 
@@ -532,6 +533,11 @@ fn main() {
             disconnect,
             traffic,
             ping_all,
+            popover::popover_state,
+            popover::ping_servers,
+            popover::hide_popover,
+            popover::open_main_window,
+            popover::quit_app,
         ])
         .setup(move |app| {
             if let Ok(dir) = app.path().resource_dir() {
@@ -544,9 +550,11 @@ fn main() {
                 .icon_as_template(cfg!(target_os = "macos"))
                 .tooltip("Veil — Disconnected")
                 .menu(&tray_menu(&handle, &app.state::<Mutex<Core>>().blocking_lock().tray_info())?)
-                // macOS: menu on any click. Windows: left click opens the window, right click the menu.
-                .show_menu_on_left_click(cfg!(target_os = "macos"))
+                // Right click: the menu. Left click: the menu bar panel on macOS, the window on Windows.
+                .show_menu_on_left_click(false)
                 .on_tray_icon_event(|tray, event| {
+                    #[cfg(target_os = "macos")]
+                    popover::mac::on_tray_event(tray, &event);
                     if cfg!(windows)
                         && let tauri::tray::TrayIconEvent::Click {
                             button: tauri::tray::MouseButton::Left,
@@ -618,6 +626,10 @@ fn main() {
                     }
                 })
                 .build(app)?;
+
+            // The menu bar panel, created hidden now so that the first click opens it at once.
+            #[cfg(target_os = "macos")]
+            let _ = popover::mac::window(app.handle());
 
             // Follow the taskbar's light/dark theme switches.
             #[cfg(windows)]
@@ -694,6 +706,9 @@ fn main() {
                 api.prevent_close();
                 let _ = window.hide();
             }
+            // The menu bar panel closes when it loses focus, like a menu.
+            #[cfg(target_os = "macos")]
+            popover::mac::on_window_event(window, event);
         })
         .build(tauri::generate_context!())
         .expect("error while building Veil");

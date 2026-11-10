@@ -3,5 +3,24 @@
   "identifier": "default",
   "description": "Main window",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "allow-snapshot",
+    "allow-import",
+    "allow-refresh-subscriptions",
+    "allow-delete-subscription",
+    "allow-delete-profile",
+    "allow-select-profile",
+    "allow-set-mode",
+    "allow-set-preset",
+    "allow-toggle-pin",
+    "allow-suggest-geosite",
+    "allow-get-rules",
+    "allow-set-rules",
+    "allow-list-apps",
+    "allow-connect",
+    "allow-disconnect",
+    "allow-traffic",
+    "allow-ping-all"
+  ]
 }

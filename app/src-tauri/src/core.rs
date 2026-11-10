@@ -236,6 +236,11 @@ impl Core {
         self.conn.is_some()
     }
 
+    /// The error of the last connection attempt (or of a TUN that died), if any.
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
     /// What the tray menu shows; cheap to build, no async.
     pub fn tray_info(&self) -> TrayInfo {
         let selected = self.state.selected_profile();
@@ -667,26 +672,45 @@ impl Core {
     /// interface so that a running VPN (ours in TUN mode, or another one)
     /// neither fakes TCP handshakes nor detours UDP through its tunnel.
     pub async fn ping_all(&mut self) -> Result<()> {
-        let pin = tokio::task::spawn_blocking(|| veil_engine::tun::physical_bypass().map(|(_, b)| b))
-            .await?
-            .ok();
-        let targets: Vec<(Uuid, veil_config::ServerConfig)> =
-            self.state.profiles.iter().map(|p| (p.id, p.server.clone())).collect();
-        let mut set = tokio::task::JoinSet::new();
-        for (id, server) in targets {
-            let pin = pin.clone();
-            set.spawn(async move { (id, ping(&server, pin).await) });
-        }
-        while let Some(r) = set.join_next().await {
-            if let Ok((id, rtt)) = r
-                && let Some(p) = self.state.profiles.iter_mut().find(|p| p.id == id)
-            {
+        let targets = self.state.profiles.iter().map(|p| (p.id, p.server.clone())).collect();
+        let results = measure(targets).await?;
+        self.set_latencies(results);
+        self.save()
+    }
+
+    /// The servers among `ids` to measure with [`measure`], without holding the lock.
+    pub fn ping_targets(&self, ids: &[Uuid]) -> Vec<(Uuid, veil_config::ServerConfig)> {
+        self.state.profiles.iter().filter(|p| ids.contains(&p.id)).map(|p| (p.id, p.server.clone())).collect()
+    }
+
+    /// Stores what [`measure`] found (in memory; saved with the next change of settings).
+    pub fn set_latencies(&mut self, results: Vec<(Uuid, Option<Duration>)>) {
+        for (id, rtt) in results {
+            if let Some(p) = self.state.profiles.iter_mut().find(|p| p.id == id) {
                 // At least 1 ms: 0 is reserved for "unreachable".
                 p.latency_ms = Some(rtt.map_or(0, |d| (d.as_millis() as u32).max(1)));
             }
         }
-        self.save()
     }
+}
+
+/// One round trip to each server, all at once (`None`: no answer).
+pub async fn measure(targets: Vec<(Uuid, veil_config::ServerConfig)>) -> Result<Vec<(Uuid, Option<Duration>)>> {
+    let pin = tokio::task::spawn_blocking(|| veil_engine::tun::physical_bypass().map(|(_, b)| b))
+        .await?
+        .ok();
+    let mut set = tokio::task::JoinSet::new();
+    for (id, server) in targets {
+        let pin = pin.clone();
+        set.spawn(async move { (id, ping(&server, pin).await) });
+    }
+    let mut out = Vec::new();
+    while let Some(r) = set.join_next().await {
+        if let Ok(found) = r {
+            out.push(found);
+        }
+    }
+    Ok(out)
 }
 
 /// One round trip to a server: the TCP handshake, or for Hysteria (UDP only)
@@ -720,7 +744,7 @@ fn skipped_note(skipped: usize) -> String {
     }
 }
 
-const TUN_AVAILABLE: bool = cfg!(any(target_os = "macos", windows));
+pub const TUN_AVAILABLE: bool = cfg!(any(target_os = "macos", windows));
 
 /// Windows: elevation check, UAC restart and the wintun.dll check.
 #[cfg(windows)]
