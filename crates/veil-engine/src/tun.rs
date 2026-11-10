@@ -44,21 +44,130 @@ const FALLBACK_DNS: [IpAddr; 3] = [
 /// Idle established TCP connections are dropped after this long.
 const TCP_IDLE: Duration = Duration::from_secs(600);
 
+/// How often the TUN looks for a change of the physical network.
+const NET_POLL: Duration = Duration::from_secs(3);
+/// How many polls in a row must see the same new network before the TUN follows it
+/// (switching networks passes through short-lived states).
+const NET_STABLE_POLLS: u32 = 2;
+
 /// The physical interface carrying the default route, and DNS servers usable
 /// through it, for sockets that must bypass any tunnel (ours or another VPN's).
 pub fn physical_bypass() -> Result<(String, Bypass)> {
+    physical_net().map(|(phys, bypass, _)| (phys, bypass))
+}
+
+/// Like [`physical_bypass`], plus the system's own DNS servers (without the fallbacks).
+fn physical_net() -> Result<(String, Bypass, Vec<IpAddr>)> {
     let phys = veil_sysproxy::default_interface()?;
     let if_index = interface_index(&phys)?;
-    let mut dns: Vec<IpAddr> = veil_sysproxy::system_dns()?
-        .into_iter()
+    let sys = filter_system_dns(veil_sysproxy::system_dns()?);
+    let dns = with_fallbacks(&sys);
+    Ok((phys, Bypass { if_index, dns }, sys))
+}
+
+/// System DNS servers usable directly: not loopback and not our own TUN resolver.
+fn filter_system_dns(sys: Vec<IpAddr>) -> Vec<IpAddr> {
+    sys.into_iter()
         .filter(|ip| !ip.is_loopback() && !FakeIp::is_fake(*ip) && *ip != IpAddr::V4(DNS_ADDR))
-        .collect();
+        .collect()
+}
+
+/// The bypass DNS list: the system servers first, then [`FALLBACK_DNS`].
+fn with_fallbacks(sys: &[IpAddr]) -> Vec<IpAddr> {
+    let mut dns = sys.to_vec();
     for ip in FALLBACK_DNS {
         if !dns.contains(&ip) {
             dns.push(ip);
         }
     }
-    Ok((phys, Bypass { if_index, dns }))
+    dns
+}
+
+/// Where our own (bypassing) traffic leaves the machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NetState {
+    phys: String,
+    gateway: Option<IpAddr>,
+    /// The system's own DNS servers; `None` when it reports none usable (on macOS our DNS
+    /// override hides them while the TUN is up), which says nothing about a change.
+    dns: Option<Vec<IpAddr>>,
+}
+
+impl NetState {
+    fn new(phys: String, gateway: Option<IpAddr>, sys_dns: Vec<IpAddr>) -> Self {
+        Self { phys, gateway, dns: (!sys_dns.is_empty()).then_some(sys_dns) }
+    }
+}
+
+/// An observation the watcher may act on: a real interface (not our TUN) with a gateway.
+/// Without one the network is gone or switching: nothing is changed then.
+fn usable_observation(seen: NetState, tun_name: &str) -> Option<NetState> {
+    (seen.gateway.is_some() && !seen.phys.is_empty() && seen.phys != tun_name).then_some(seen)
+}
+
+/// Whether `seen` is another network than `cur`: interface, gateway or (when known) DNS.
+fn network_changed(cur: &NetState, seen: &NetState) -> bool {
+    cur.phys != seen.phys || cur.gateway != seen.gateway || (seen.dns.is_some() && seen.dns != cur.dns)
+}
+
+/// The state to switch to: `seen`, keeping the known DNS servers when they cannot be seen
+/// and the interface and gateway are the same (another network: its DNS is unknown).
+fn next_state(cur: &NetState, seen: &NetState) -> NetState {
+    let same_link = cur.phys == seen.phys && cur.gateway == seen.gateway;
+    let dns = seen.dns.clone().or_else(|| if same_link { cur.dns.clone() } else { None });
+    NetState { phys: seen.phys.clone(), gateway: seen.gateway, dns }
+}
+
+/// Follows a new network only after [`NET_STABLE_POLLS`] identical observations in a row.
+#[derive(Debug, Default)]
+struct NetDebounce {
+    candidate: Option<NetState>,
+    hits: u32,
+}
+
+impl NetDebounce {
+    /// Feeds one poll (`None`: no usable network). Returns the state to switch to, once.
+    fn feed(&mut self, cur: &NetState, seen: Option<NetState>) -> Option<NetState> {
+        let Some(seen) = seen.filter(|s| network_changed(cur, s)) else {
+            *self = Self::default();
+            return None;
+        };
+        if self.candidate.as_ref() == Some(&seen) {
+            self.hits += 1;
+        } else {
+            self.candidate = Some(seen.clone());
+            self.hits = 1;
+        }
+        if self.hits < NET_STABLE_POLLS {
+            return None;
+        }
+        *self = Self::default();
+        Some(next_state(cur, &seen))
+    }
+}
+
+/// The physical network as seen now, by the same calls as at start. Blocking.
+fn probe_network(tun_name: &str) -> Option<NetState> {
+    #[cfg(windows)]
+    let (phys, gateway, sys) = veil_sysproxy::default_route_snapshot().ok()?;
+    #[cfg(not(windows))]
+    let (phys, gateway, sys) = (
+        veil_sysproxy::default_interface().ok()?,
+        veil_sysproxy::default_gateway().ok(),
+        veil_sysproxy::system_dns().unwrap_or_default(),
+    );
+    usable_observation(NetState::new(phys, gateway, filter_system_dns(sys)), tun_name)
+}
+
+/// Routing state that follows the physical network; shared with the watcher task.
+struct NetCfg {
+    state: NetState,
+    /// We added the scoped default route on `state.phys` (and must remove it).
+    scoped_default: bool,
+    /// Proxy server addresses that have to go around the tunnel.
+    servers: Vec<IpAddr>,
+    /// Host routes in place, through `state.gateway`.
+    host_routes: Vec<IpAddr>,
 }
 
 #[cfg(unix)]
@@ -158,11 +267,12 @@ pub(crate) struct Tun {
     name: String,
     task: JoinHandle<()>,
     dns_backup: PathBuf,
-    phys: String,
-    gateway: Option<IpAddr>,
-    scoped_default: bool,
-    /// Host routes to proxy servers via the original gateway.
-    host_routes: Mutex<Vec<IpAddr>>,
+    /// Physical interface, gateway, scoped default and host routes: always the current ones,
+    /// the network watcher updates them when the physical network changes.
+    net: Arc<tokio::sync::Mutex<NetCfg>>,
+    /// Ends the network watcher (so does dropping it).
+    watch_stop: Option<tokio::sync::oneshot::Sender<()>>,
+    watcher: Option<JoinHandle<()>>,
     /// The packet loop ended on its own (device error): nothing is tunnelled any more.
     dead: Arc<AtomicBool>,
     /// Our NRPT rule is (or may be) in the system and has to be removed.
@@ -228,10 +338,11 @@ impl Tun {
         let backup = opts.dns_backup.clone();
         blocking(move || veil_sysproxy::dns_restore(&backup)).await??;
 
-        let (phys, bypass) = blocking(physical_bypass).await??;
+        let (phys, bypass, sys_dns) = blocking(physical_net).await??;
         let upstream = bypass.dns.clone();
         let gateway = blocking(|| veil_sysproxy::default_gateway().ok()).await?;
         tracing::info!("physical interface {phys}, gateway {gateway:?}, direct DNS {upstream:?}");
+        let state = NetState::new(phys, gateway, sys_dns);
         dial::set_bypass(Some(bypass));
         // Host routes of a run that died without cleaning up would outlive it.
         #[cfg(windows)]
@@ -239,7 +350,7 @@ impl Tun {
             let _ = blocking(move || veil_sysproxy::cleanup_orphan_host_routes(gw)).await;
         }
 
-        let result = Self::bring_up(shared, &opts, phys, gateway).await;
+        let result = Self::bring_up(shared, &opts, state).await;
         if let Ok(tun) = &result {
             // From here on the system depends on this process: have someone watch it.
             #[cfg(windows)]
@@ -289,7 +400,8 @@ impl Tun {
         Ok(scoped_default)
     }
 
-    async fn bring_up(shared: Arc<Shared>, opts: &TunOptions, phys: String, gateway: Option<IpAddr>) -> Result<Self> {
+    async fn bring_up(shared: Arc<Shared>, opts: &TunOptions, state: NetState) -> Result<Self> {
+        let (phys, gateway) = (state.phys.clone(), state.gateway);
         let builder = DeviceBuilder::new();
         // A fixed alias: cleanup and veil-rescue.ps1 recognise our adapter by it (and its address).
         #[cfg(windows)]
@@ -406,14 +518,20 @@ impl Tun {
                 return Err(e);
             }
         };
+        let net = Arc::new(tokio::sync::Mutex::new(NetCfg {
+            state,
+            scoped_default,
+            servers: Vec::new(),
+            host_routes: Vec::new(),
+        }));
+        let (watch_stop, watcher) = spawn_net_watch(net.clone(), name.clone(), opts.routes);
         Ok(Self {
             name,
             task,
             dns_backup: opts.dns_backup.clone(),
-            phys,
-            gateway,
-            scoped_default,
-            host_routes: Mutex::new(Vec::new()),
+            net,
+            watch_stop: Some(watch_stop),
+            watcher: Some(watcher),
             dead,
             #[cfg(windows)]
             nrpt,
@@ -468,8 +586,9 @@ impl Tun {
     }
 
     /// Routes the (new) proxy server's address around the tunnel.
+    /// The server is remembered even without a gateway: the network watcher routes it
+    /// once there is one, and again through every new gateway.
     pub(crate) async fn server_changed(&self, server: &ServerConfig) {
-        let Some(gw) = self.gateway else { return };
         let addr = Address::from_host(&server.address, server.port);
         let ips: Vec<IpAddr> = match dial::resolve(&addr).await {
             Ok(a) => a.iter().map(|s| s.ip()).collect(),
@@ -478,35 +597,41 @@ impl Tun {
                 return;
             }
         };
-        let new: Vec<IpAddr> = {
-            let known = self.host_routes.lock().unwrap();
-            ips.into_iter().filter(|ip| !known.contains(ip)).collect()
-        };
+        // Held across the route changes: the watcher must not re-route meanwhile.
+        let mut net = self.net.lock().await;
+        for ip in &ips {
+            if !net.servers.contains(ip) {
+                net.servers.push(*ip);
+            }
+        }
+        let Some(gw) = net.state.gateway else { return };
+        let new: Vec<IpAddr> = ips.into_iter().filter(|ip| !net.host_routes.contains(ip)).collect();
         if new.is_empty() {
             return;
         }
-        let added = blocking(move || {
-            new.into_iter()
-                .filter(|&ip| {
-                    let ok = veil_sysproxy::add_host_route(ip, gw);
-                    if !ok && ip.is_ipv6() {
-                        tracing::warn!("IPv6 server {ip} has no host route: its connections are not protected from looping into the tunnel");
-                    }
-                    ok
-                })
-                .collect::<Vec<_>>()
-        })
-        .await;
-        match added {
+        match blocking(move || add_host_routes(new, gw)).await {
             Ok(added) => {
-                let mut routes = self.host_routes.lock().unwrap();
                 for ip in added {
-                    if !routes.contains(&ip) {
-                        routes.push(ip);
+                    if !net.host_routes.contains(&ip) {
+                        net.host_routes.push(ip);
                     }
                 }
             }
             Err(e) => tracing::warn!("host routes: {e:#}"),
+        }
+    }
+
+    /// Ends the network watcher, letting a re-routing in progress finish first.
+    async fn stop_net_watch(&mut self) {
+        if let Some(tx) = self.watch_stop.take() {
+            let _ = tx.send(());
+        }
+        if let Some(mut watcher) = self.watcher.take()
+            && tokio::time::timeout(Duration::from_secs(30), &mut watcher).await.is_err()
+        {
+            tracing::warn!("network watcher did not stop in time");
+            watcher.abort();
+            let _ = watcher.await;
         }
     }
 
@@ -515,12 +640,19 @@ impl Tun {
         // system if anything below hangs or the process dies half-way.
         #[cfg(windows)]
         self.disable_nrpt().await;
+        // Before reading the routing state: it must not change under the teardown.
+        self.stop_net_watch().await;
         self.task.abort();
         let _ = (&mut self.task).await;
-        let host_routes: Vec<IpAddr> = self.host_routes.lock().unwrap().drain(..).collect();
+        // The current interface, gateway and routes (the watcher may have replaced the ones from start).
+        let (phys, gateway, scoped_default, host_routes) = {
+            let mut net = self.net.lock().await;
+            let host_routes = std::mem::take(&mut net.host_routes);
+            let scoped_default = std::mem::replace(&mut net.scoped_default, false);
+            (net.state.phys.clone(), net.state.gateway, scoped_default, host_routes)
+        };
         // `Tun` implements `Drop` on Windows, so its fields cannot be moved out.
-        let (name, phys, dns_backup) = (self.name.clone(), self.phys.clone(), self.dns_backup.clone());
-        let (gateway, scoped_default) = (self.gateway, self.scoped_default);
+        let (name, dns_backup) = (self.name.clone(), self.dns_backup.clone());
         let name_log = name.clone();
         let res = blocking(move || {
             veil_sysproxy::remove_tun_routes(&name);
@@ -619,6 +751,85 @@ async fn undo_routes(name: String, phys: String, scoped_default: bool) {
         }
     })
     .await;
+}
+
+/// Adds host routes through `gw`; returns the ones added. Blocking.
+fn add_host_routes(ips: Vec<IpAddr>, gw: IpAddr) -> Vec<IpAddr> {
+    ips.into_iter()
+        .filter(|&ip| {
+            let ok = veil_sysproxy::add_host_route(ip, gw);
+            if !ok && ip.is_ipv6() {
+                tracing::warn!("IPv6 server {ip} has no host route: its connections are not protected from looping into the tunnel");
+            }
+            ok
+        })
+        .collect()
+}
+
+/// Polls the physical network every [`NET_POLL`] and moves the bypass (pinned sockets,
+/// scoped default route, host routes to the servers) to a new interface or gateway once it
+/// is stable. The split routes and the DNS setting point at the TUN and stay. Ends when
+/// told to or when the sender is dropped (the `Tun` is gone).
+fn spawn_net_watch(
+    net: Arc<tokio::sync::Mutex<NetCfg>>,
+    tun_name: String,
+    routes: TunRoutes,
+) -> (tokio::sync::oneshot::Sender<()>, JoinHandle<()>) {
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let mut debounce = NetDebounce::default();
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                _ = tokio::time::sleep(NET_POLL) => {}
+            }
+            let name = tun_name.clone();
+            let seen = blocking(move || probe_network(&name)).await.ok().flatten();
+            let mut cfg = net.lock().await;
+            let Some(next) = debounce.feed(&cfg.state, seen) else { continue };
+            if let Err(e) = reroute(&mut cfg, next, routes).await {
+                tracing::warn!("network changed, but following it failed (will retry): {e:#}");
+            }
+        }
+    });
+    (tx, task)
+}
+
+/// Moves the bypass to the network `next`. On error nothing is recorded as changed, so
+/// the watcher tries again.
+async fn reroute(cfg: &mut NetCfg, next: NetState, routes: TunRoutes) -> Result<()> {
+    let phys = next.phys.clone();
+    let if_index = blocking(move || interface_index(&phys)).await??;
+    let dns = with_fallbacks(next.dns.as_deref().unwrap_or_default());
+    tracing::info!(
+        "network changed: interface {} -> {}, gateway {:?} -> {:?}, direct DNS {dns:?}",
+        cfg.state.phys,
+        next.phys,
+        cfg.state.gateway,
+        next.gateway
+    );
+    dial::set_bypass(Some(Bypass { if_index, dns }));
+    let (old_phys, old_gw, old_scoped) = (cfg.state.phys.clone(), cfg.state.gateway, cfg.scoped_default);
+    let old_routes = cfg.host_routes.clone();
+    let (new_phys, new_gw, servers) = (next.phys.clone(), next.gateway, cfg.servers.clone());
+    let done = blocking(move || {
+        for ip in old_routes {
+            remove_host_route(ip, old_gw);
+        }
+        if old_scoped {
+            veil_sysproxy::remove_scoped_default(&old_phys);
+        }
+        let scoped = match new_gw {
+            Some(gw) if routes != TunRoutes::Domains => veil_sysproxy::add_scoped_default(&new_phys, gw),
+            _ => false,
+        };
+        let added = new_gw.map(|gw| add_host_routes(servers, gw)).unwrap_or_default();
+        (scoped, added)
+    })
+    .await?;
+    (cfg.scoped_default, cfg.host_routes) = done;
+    cfg.state = next;
+    Ok(())
 }
 
 /// Removes a host route; on Windows only the one through `gateway` when it is known.
@@ -803,6 +1014,80 @@ mod tests {
         .join();
         assert!(r.is_err());
         assert!(flag.load(Ordering::SeqCst), "a panic marks the loop dead");
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// No `dns`: the system shows none of its own.
+    fn net(phys: &str, gw: Option<&str>, dns: &[&str]) -> NetState {
+        NetState::new(phys.into(), gw.map(ip), dns.iter().map(|s| ip(s)).collect())
+    }
+
+    #[test]
+    fn system_dns_filtering_and_fallbacks() {
+        let sys = filter_system_dns(vec![ip("127.0.0.1"), IpAddr::V4(DNS_ADDR), ip("198.18.0.9"), ip("192.168.1.1")]);
+        assert_eq!(sys, vec![ip("192.168.1.1")]);
+        assert_eq!(with_fallbacks(&sys), vec![ip("192.168.1.1"), ip("77.88.8.8"), ip("1.1.1.1"), ip("8.8.8.8")]);
+        assert_eq!(with_fallbacks(&[ip("1.1.1.1")]), vec![ip("1.1.1.1"), ip("77.88.8.8"), ip("8.8.8.8")]);
+        // Only our own resolver left (macOS, DNS overridden): unknown, not "no servers".
+        assert_eq!(NetState::new("en0".into(), None, filter_system_dns(vec![IpAddr::V4(DNS_ADDR)])).dns, None);
+    }
+
+    #[test]
+    fn network_change_detection() {
+        let home = net("en0", Some("192.168.1.1"), &["192.168.1.1"]);
+        assert!(!network_changed(&home, &home));
+        // Same Wi-Fi interface, the iPhone hotspot's gateway.
+        assert!(network_changed(&home, &net("en0", Some("172.20.10.1"), &[])));
+        assert!(network_changed(&home, &net("en7", Some("192.168.1.1"), &[])));
+        assert!(network_changed(&home, &net("en0", Some("192.168.1.1"), &["9.9.9.9"])));
+        // DNS hidden by our override is no change.
+        assert!(!network_changed(&home, &net("en0", Some("192.168.1.1"), &[])));
+        // Only usable observations count: a gateway, a real interface, not our TUN.
+        assert!(usable_observation(net("en0", None, &[]), "utun5").is_none());
+        assert!(usable_observation(net("utun5", Some("10.0.0.1"), &[]), "utun5").is_none());
+        assert!(usable_observation(net("", Some("10.0.0.1"), &[]), "utun5").is_none());
+        assert!(usable_observation(net("en0", Some("10.0.0.1"), &[]), "utun5").is_some());
+        // The next state keeps the DNS servers only on the same link.
+        assert_eq!(next_state(&home, &net("en0", Some("172.20.10.1"), &[])), net("en0", Some("172.20.10.1"), &[]));
+        assert_eq!(
+            next_state(&home, &net("en0", Some("192.168.1.1"), &["9.9.9.9"])),
+            net("en0", Some("192.168.1.1"), &["9.9.9.9"])
+        );
+        let no_dns = net("en0", Some("192.168.1.1"), &[]);
+        assert_eq!(next_state(&no_dns, &net("en0", Some("192.168.1.1"), &[])), no_dns);
+    }
+
+    #[test]
+    fn network_debounce() {
+        let home = net("en0", Some("192.168.1.1"), &["192.168.1.1"]);
+        let phone = net("en0", Some("172.20.10.1"), &[]);
+        let mut d = NetDebounce::default();
+        // Unchanged or offline: nothing, ever.
+        for _ in 0..5 {
+            assert_eq!(d.feed(&home, Some(home.clone())), None);
+            assert_eq!(d.feed(&home, None), None);
+        }
+        // A new network has to be seen twice in a row.
+        assert_eq!(d.feed(&home, Some(phone.clone())), None);
+        assert_eq!(d.feed(&home, Some(phone.clone())), Some(phone.clone()));
+        // Then it starts over (the caller has switched, or will retry after a failure).
+        assert_eq!(d.feed(&home, Some(phone.clone())), None);
+        assert_eq!(d.feed(&home, Some(phone.clone())), Some(phone.clone()));
+        // Flapping between states, or a gap without network, never switches.
+        let other = net("en7", Some("10.0.0.1"), &[]);
+        let mut d = NetDebounce::default();
+        for _ in 0..3 {
+            assert_eq!(d.feed(&home, Some(phone.clone())), None);
+            assert_eq!(d.feed(&home, Some(other.clone())), None);
+        }
+        assert_eq!(d.feed(&home, None), None);
+        assert_eq!(d.feed(&home, Some(other.clone())), None);
+        assert_eq!(d.feed(&home, Some(home.clone())), None);
+        assert_eq!(d.feed(&home, Some(other.clone())), None);
+        assert_eq!(d.feed(&home, Some(other.clone())), Some(other));
     }
 
     #[tokio::test]

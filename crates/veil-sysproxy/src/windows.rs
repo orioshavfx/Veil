@@ -355,6 +355,16 @@ pub fn default_gateway() -> Result<IpAddr> {
     Ok(best.next_hop)
 }
 
+/// [`default_interface`], [`default_gateway`] (`None` without one) and [`system_dns`] from
+/// a single look at the default routes, for the TUN's network watcher.
+pub fn default_route_snapshot() -> Result<(String, Option<IpAddr>, Vec<IpAddr>)> {
+    let routes = default_routes()?;
+    let best = winnet::best_default(&routes).context("no default route (offline?)")?;
+    let gateway = (!best.next_hop.is_unspecified()).then_some(best.next_hop);
+    let dns = winnet::parse_ip_lines(&ps(&winnet::dns_of_interface_script(best.index), &[])?);
+    Ok((best.alias.clone(), gateway, dns))
+}
+
 /// DNS servers configured on the interface carrying the default route.
 pub fn system_dns() -> Result<Vec<IpAddr>> {
     let routes = default_routes()?;
