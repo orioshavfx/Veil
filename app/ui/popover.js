@@ -12,15 +12,8 @@ let pingTimer = null;
 let trafficTimer = null;
 let pinging = false;
 let polling = false;
-let last = null; // previous traffic sample, for speed
+let last = null; // previous traffic sample, for the timer
 let seconds = 0;
-
-function bytes(n) {
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let i = 0;
-  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
-  return `${n < 10 && i ? n.toFixed(1) : Math.round(n)} ${units[i]}`;
-}
 
 function clock(s) {
   const p = (x) => String(x).padStart(2, '0');
@@ -32,11 +25,6 @@ function el(tag, cls, text) {
   if (cls) e.className = cls;
   if (text !== undefined) e.textContent = text;
   return e;
-}
-
-// The main window's "Speed: on/off" switch (same origin, so the same storage).
-function speedOn() {
-  try { return localStorage.getItem('veil.speed') !== '0'; } catch { return true; }
 }
 
 function showError(e) {
@@ -67,23 +55,25 @@ function render() {
   $('power').setAttribute('aria-label', s.connected ? 'Disconnect' : 'Connect');
   $('status').textContent = busyLabel || (s.connected ? `Connected · ${clock(seconds)}` : 'Disconnected');
   $('server').textContent = s.server_name || 'No server selected';
-  $('speed').hidden = !(s.connected && speedOn());
+  const cur = s.current;
+  $('cur-dot').className = `dot ${cur ? cur.level : 'unknown'}`;
+  $('cur-ms').textContent = cur ? msText(cur) : '—';
+  $('cur-ping').hidden = !cur;
   if (!s.connected) { last = null; seconds = 0; }
 
   $('error').hidden = !s.error || s.connected;
   $('error').textContent = s.error || '';
   $('error').title = s.error || '';
 
-  for (const b of $('mode').querySelectorAll('button')) {
-    b.setAttribute('aria-checked', String(b.dataset.mode === s.mode));
-    b.disabled = b.dataset.mode === 'tun' && !s.tun_available && s.mode !== 'tun';
-  }
-
-  $('list-title').textContent = s.pinned ? 'Pinned servers' : 'Servers';
-  $('hint').hidden = s.pinned || !s.has_servers;
+  $('list').setAttribute('aria-label', s.pinned ? 'Pinned servers' : 'Servers');
+  $('list').title = s.pinned || !s.has_servers ? '' : 'Pin servers with ☆ in the main window to keep them here.';
   const rows = s.servers.map(renderServer);
   if (!rows.length) rows.push(el('div', 'empty', 'No servers yet. Open Veil to add a link or a subscription.'));
   $('list').replaceChildren(...rows);
+}
+
+function msText(p) {
+  return p.latency_ms === 0 ? 'timeout' : p.latency_ms ? `${p.latency_ms} ms` : '—';
 }
 
 function renderServer(p) {
@@ -92,8 +82,7 @@ function renderServer(p) {
   row.setAttribute('role', 'option');
   row.setAttribute('aria-selected', String(p.selected));
   row.title = p.name;
-  const ms = p.latency_ms === 0 ? 'timeout' : p.latency_ms ? `${p.latency_ms} ms` : '—';
-  row.append(el('span', `dot ${p.level}`), el('span', 'name', p.name), el('span', 'ms', ms), el('span', 'check', p.selected ? '✓' : ''));
+  row.append(el('span', `dot ${p.level}`), el('span', 'name', p.name), el('span', 'ms', msText(p)));
   row.onclick = () => {
     if (p.selected) return;
     // Same as the main window: the running session switches to the new server.
@@ -125,12 +114,6 @@ $('power').onclick = () => {
   action(on ? 'Disconnecting…' : 'Connecting…', () => invoke(on ? 'disconnect' : 'connect'));
 };
 
-$('mode').onclick = (e) => {
-  const mode = e.target.dataset?.mode;
-  if (!mode || !state || mode === state.mode || e.target.disabled) return;
-  action(state.connected ? 'Reconnecting…' : null, () => invoke('set_mode', { mode }));
-};
-
 $('open').onclick = () => invoke('open_main_window');
 $('quit').onclick = () => invoke('quit_app');
 
@@ -141,10 +124,12 @@ document.addEventListener('keydown', (e) => {
 // ---- ping: only the servers shown, only while the panel is open --------------
 
 async function ping() {
-  if (!open || pinging || !state?.servers.length) return;
+  if (!open || pinging || !state) return;
+  const ids = [...new Set([...(state.current ? [state.current.id] : []), ...state.servers.map((s) => s.id)])];
+  if (!ids.length) return;
   pinging = true;
   try {
-    await invoke('ping_servers', { ids: state.servers.map((s) => s.id) });
+    await invoke('ping_servers', { ids });
   } catch (e) {
     console.warn(e);
   } finally {
@@ -162,13 +147,7 @@ async function traffic() {
     const t = await invoke('traffic');
     if (!state?.connected) return;
     if (!t.connected) { reload(); return; }
-    const now = performance.now();
-    if (last && now > last.at && t.seconds >= last.seconds) {
-      const dt = (now - last.at) / 1000;
-      $('up').textContent = `${bytes(Math.max(0, t.upload - last.upload) / dt)}/s`;
-      $('down').textContent = `${bytes(Math.max(0, t.download - last.download) / dt)}/s`;
-    }
-    last = { ...t, at: now };
+    last = t;
     seconds = t.seconds;
     if (busyLabel === null) $('status').textContent = `Connected · ${clock(seconds)}`;
   } catch {
@@ -182,7 +161,6 @@ async function opened() {
   if (open) return;
   open = true;
   last = null;
-  $('up').textContent = $('down').textContent = '0 B/s';
   await reload();
   if (!open) return;
   traffic();

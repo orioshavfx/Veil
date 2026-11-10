@@ -7,34 +7,22 @@
   <link rel="stylesheet" href="popover.css">
 </head>
 <body>
-  <section class="hero" id="hero">
+  <main class="panel" id="hero">
     <button class="power" id="power" type="button" aria-label="Connect">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v8M6.3 6.8a8 8 0 1 0 11.4 0" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
     </button>
-    <div class="hero-text">
-      <div class="status" id="status">Disconnected</div>
-      <div class="server" id="server">No server selected</div>
-      <div class="speed" id="speed" hidden><span>↑ <b id="up">0 B/s</b></span><span>↓ <b id="down">0 B/s</b></span></div>
-    </div>
-  </section>
-  <p class="error" id="error" hidden></p>
+    <div class="status" id="status">Disconnected</div>
+    <div class="server" id="server">No server selected</div>
+    <div class="cur-ping" id="cur-ping"><span class="dot unknown" id="cur-dot"></span><span id="cur-ms">—</span></div>
+    <p class="error" id="error" hidden></p>
 
-  <div class="mode-row">
-    <span>Mode</span>
-    <div class="seg" id="mode" role="radiogroup" aria-label="Connection mode">
-      <button type="button" data-mode="proxy" role="radio">Proxy</button>
-      <button type="button" data-mode="tun" role="radio">TUN</button>
-    </div>
-  </div>
+    <div class="list" id="list" role="listbox" aria-label="Pinned servers"></div>
 
-  <div class="list-title" id="list-title">Pinned servers</div>
-  <div class="list" id="list" role="listbox" aria-labelledby="list-title"></div>
-  <p class="hint" id="hint" hidden>Pin servers with ☆ in the main window to keep them here.</p>
-
-  <footer>
-    <button type="button" id="open">Open Veil</button>
-    <button type="button" id="quit">Quit</button>
-  </footer>
+    <footer>
+      <button type="button" id="open">Open Veil</button>
+      <button type="button" id="quit">Quit</button>
+    </footer>
+  </main>
   <script src="popover.js"></script>
 </body>
 </html>

@@ -17,10 +17,10 @@ use crate::core::Core;
 /// Window label of the panel.
 pub const LABEL: &str = "popover";
 /// Panel size in points.
-pub const WIDTH: f64 = 320.0;
-pub const HEIGHT: f64 = 420.0;
+pub const WIDTH: f64 = 264.0;
+pub const HEIGHT: f64 = 320.0;
 /// Servers shown (and pinged) when the user has pinned none.
-pub const UNPINNED_LIMIT: usize = 5;
+pub const UNPINNED_LIMIT: usize = 2;
 /// Gap between the menu bar icon and the panel, and the minimum distance to the screen edge.
 const GAP: f64 = 4.0;
 const MARGIN: f64 = 6.0;
@@ -185,6 +185,8 @@ pub struct PopoverState {
     pinned: bool,
     /// Whether there is any server at all.
     has_servers: bool,
+    /// The selected server (shown under the status with its ping).
+    current: Option<PopoverServer>,
     servers: Vec<PopoverServer>,
 }
 
@@ -193,17 +195,15 @@ fn view(core: &Core) -> PopoverState {
     let selected = state.selected_profile();
     let flags: Vec<bool> = state.profiles.iter().map(|p| p.pinned).collect();
     let (shown, pinned) = shown_servers(&flags);
-    let servers = shown
-        .into_iter()
-        .filter_map(|i| state.profiles.get(i))
-        .map(|p| PopoverServer {
-            id: p.id,
-            name: p.name.clone(),
-            latency_ms: p.latency_ms,
-            level: ping_level(p.latency_ms),
-            selected: selected.is_some_and(|s| s.id == p.id),
-        })
-        .collect();
+    let make = |p: &veil_config::model::Profile| PopoverServer {
+        id: p.id,
+        name: p.name.clone(),
+        latency_ms: p.latency_ms,
+        level: ping_level(p.latency_ms),
+        selected: selected.is_some_and(|s| s.id == p.id),
+    };
+    let servers = shown.into_iter().filter_map(|i| state.profiles.get(i)).map(make).collect();
+    let current = selected.map(make);
     PopoverState {
         connected: core.is_connected(),
         server_name: selected.map(|p| p.name.clone()),
@@ -212,6 +212,7 @@ fn view(core: &Core) -> PopoverState {
         error: core.last_error().map(str::to_string),
         pinned,
         has_servers: !state.profiles.is_empty(),
+        current,
         servers,
     }
 }
@@ -309,6 +310,7 @@ pub mod mac {
             .maximizable(false)
             .minimizable(false)
             .decorations(false)
+            .transparent(true)
             .always_on_top(true)
             .skip_taskbar(true)
             .visible_on_all_workspaces(true)
@@ -467,7 +469,7 @@ mod tests {
         // An icon below the work area: the panel stays inside it.
         let (_, y) = panel_origin(Bounds::new(600.0, 765.0, 24.0, 24.0), work, WIDTH, HEIGHT);
         assert_eq!(y, 760.0 - HEIGHT);
-        let small = Bounds::new(0.0, 25.0, 300.0, 300.0);
+        let small = Bounds::new(0.0, 25.0, 200.0, 300.0);
         let (x, y) = panel_origin(Bounds::new(100.0, 0.0, 24.0, 24.0), small, WIDTH, HEIGHT);
         assert_eq!((x, y), (0.0, 25.0));
     }
@@ -498,10 +500,10 @@ mod tests {
     }
 
     #[test]
-    fn pinned_or_first_five() {
+    fn pinned_or_first_two() {
         assert_eq!(shown_servers(&[]), (vec![], false));
-        assert_eq!(shown_servers(&[false; 3]), (vec![0, 1, 2], false));
-        assert_eq!(shown_servers(&[false; 70]), ((0..5).collect(), false));
+        assert_eq!(shown_servers(&[false; 1]), (vec![0], false));
+        assert_eq!(shown_servers(&[false; 70]), (vec![0, 1], false));
         let mut many = vec![false; 70];
         for i in [3, 10, 11, 40, 50, 60, 69] {
             many[i] = true;
