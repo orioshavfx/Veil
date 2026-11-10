@@ -257,6 +257,38 @@ impl Tun {
         result
     }
 
+    /// Scoped default route, split routes and DNS override; undoes itself on failure.
+    /// Returns whether a scoped default route was added.
+    async fn setup_system(name: &str, phys: &str, gateway: Option<IpAddr>, opts: &TunOptions) -> Result<bool> {
+        let (name, phys) = (name.to_string(), phys.to_string());
+        // Keep our own sockets (pinned to the physical interface) routable once
+        // the split routes send everything else into the tunnel.
+        let scoped_default = match gateway {
+            Some(gw) if opts.routes != TunRoutes::Domains => {
+                let phys = phys.clone();
+                blocking(move || veil_sysproxy::add_scoped_default(&phys, gw)).await?
+            }
+            _ => false,
+        };
+        let undo = || undo_routes(name.clone(), phys.clone(), scoped_default);
+        let routes = opts.routes;
+        let n = name.clone();
+        if let Err(e) = blocking(move || veil_sysproxy::add_tun_routes(&n, routes)).await.and_then(|r| r) {
+            undo().await;
+            return Err(e);
+        }
+        let backup = opts.dns_backup.clone();
+        if let Err(e) = blocking(move || veil_sysproxy::dns_override(&[IpAddr::V4(DNS_ADDR)], &backup))
+            .await
+            .and_then(|r| r)
+        {
+            undo().await;
+            return Err(e);
+        }
+        tracing::info!("TUN {name} up ({:?})", opts.routes);
+        Ok(scoped_default)
+    }
+
     async fn bring_up(shared: Arc<Shared>, opts: &TunOptions, phys: String, gateway: Option<IpAddr>) -> Result<Self> {
         let builder = DeviceBuilder::new();
         // A fixed alias: cleanup and veil-rescue.ps1 recognise our adapter by it (and its address).
@@ -269,12 +301,18 @@ impl Tun {
             .build_async()
             .context("cannot create TUN device (on Windows: run as administrator, wintun.dll next to the exe)")?;
         let name = dev.name()?;
+        #[cfg(not(windows))]
+        let scoped_default = Self::setup_system(&name, &phys, gateway, opts).await?;
 
-        // The packet stack goes first: nothing in the system points at the device yet, so
+        // Windows: the packet stack goes first: nothing in the system points at the device yet, so
         // a failure up to the end of the DNS probe leaves nothing behind but the adapter,
         // which disappears with `dev`.
         let mut cfg = IpStackConfig::default();
-        cfg.mtu(opts.mtu).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        if let Err(e) = cfg.mtu(opts.mtu) {
+            #[cfg(not(windows))]
+            undo_routes(name.clone(), phys.clone(), scoped_default).await;
+            return Err(anyhow::anyhow!("{e:?}"));
+        }
         cfg.udp_timeout(UDP_IDLE);
         // The default 60 s idle timeout kills quiet HTTP/2 and websocket connections.
         let mut tcp = ipstack::TcpConfig::default();
@@ -358,39 +396,16 @@ impl Tun {
             }
         }
 
-        // Keep our own sockets (pinned to the physical interface) routable once
-        // the split routes send everything else into the tunnel.
-        let scoped_default = match gateway {
-            Some(gw) if opts.routes != TunRoutes::Domains => {
-                let phys = phys.clone();
-                match blocking(move || veil_sysproxy::add_scoped_default(&phys, gw)).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        task.abort();
-                        return Err(e);
-                    }
-                }
+        // Windows: only now, after the resolver answered the probe. (macOS did this before the
+        // stack since always: the order there is deliberately unchanged.)
+        #[cfg(windows)]
+        let scoped_default = match Self::setup_system(&name, &phys, gateway, opts).await {
+            Ok(v) => v,
+            Err(e) => {
+                task.abort();
+                return Err(e);
             }
-            _ => false,
         };
-        let undo = || undo_routes(name.clone(), phys.clone(), scoped_default);
-        let routes = opts.routes;
-        let n = name.clone();
-        if let Err(e) = blocking(move || veil_sysproxy::add_tun_routes(&n, routes)).await.and_then(|r| r) {
-            task.abort();
-            undo().await;
-            return Err(e);
-        }
-        let backup = opts.dns_backup.clone();
-        if let Err(e) = blocking(move || veil_sysproxy::dns_override(&[IpAddr::V4(DNS_ADDR)], &backup))
-            .await
-            .and_then(|r| r)
-        {
-            task.abort();
-            undo().await;
-            return Err(e);
-        }
-        tracing::info!("TUN {name} up ({:?})", opts.routes);
         Ok(Self {
             name,
             task,
