@@ -43,9 +43,12 @@ pub async fn download(dir: &Path) -> Result<()> {
             .send()
             .await
             .and_then(|r| r.error_for_status())
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("downloading {name}"))?
             .bytes()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("downloading {name}"))?;
         if bytes.len() < 64 * 1024 {
             bail!("{name}: suspiciously small download ({} bytes)", bytes.len());
         }

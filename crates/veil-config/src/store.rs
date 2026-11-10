@@ -105,6 +105,14 @@ impl Store {
 
     pub fn open(dir: &Path) -> Result<Self> {
         fs::create_dir_all(dir)?;
+        // state.json holds links, UUIDs, passwords and subscription URLs: owner only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = fs::set_permissions(dir, fs::Permissions::from_mode(0o700)) {
+                tracing::warn!("cannot restrict {}: {e}", dir.display());
+            }
+        }
         Ok(Self { path: dir.join("state.json") })
     }
 
@@ -120,10 +128,26 @@ impl Store {
         }
     }
 
-    /// Writes atomically via a temporary file.
+    /// Writes atomically via a temporary file (mode 0600 on unix).
     pub fn save(&self, state: &AppState) -> Result<()> {
         let tmp = self.path.with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_vec_pretty(state)?)?;
+        let bytes = serde_json::to_vec_pretty(state)?;
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            // A fresh file, so the mode applies even if a stale (wider) temp file was left.
+            match fs::remove_file(&tmp) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        fs::write(&tmp, bytes)?;
         fs::rename(&tmp, &self.path)?;
         Ok(())
     }
@@ -144,6 +168,28 @@ mod tests {
         store.save(&state).unwrap();
         let loaded = store.load().unwrap();
         assert_eq!(loaded.profiles, state.profiles);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = std::env::temp_dir().join(format!("veil-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        // An older, world-readable state.json and a stale temp file.
+        fs::write(dir.join("state.json"), b"{}").unwrap();
+        fs::set_permissions(dir.join("state.json"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(dir.join("state.json.tmp"), b"x").unwrap();
+        fs::set_permissions(dir.join("state.json.tmp"), fs::Permissions::from_mode(0o644)).unwrap();
+        let store = Store::open(&dir).unwrap();
+        assert_eq!(mode(&dir), 0o700);
+        store.save(&AppState::default()).unwrap();
+        assert_eq!(mode(&dir.join("state.json")), 0o600);
+        assert!(!dir.join("state.json.tmp").exists());
+        assert!(store.load().unwrap().profiles.is_empty());
         fs::remove_dir_all(dir).unwrap();
     }
 

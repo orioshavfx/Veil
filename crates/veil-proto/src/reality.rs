@@ -781,10 +781,10 @@ mod tests {
 
     #[test]
     fn params() {
-        let p = RealityParams::new("a.com", "b2t8JUZSOdqOImXHsGP9uAz5gfUHgrtY3i8Ihd08-Bk", "6ba8").unwrap();
+        let p = RealityParams::new("a.com", "IOgFivZsFuwtRLTOWITOD-PNuXxHUnkgzsqdgtfOM4Y", "6ba8").unwrap();
         assert_eq!(p.short_id, [0x6b, 0xa8, 0, 0, 0, 0, 0, 0]);
         assert!(RealityParams::new("a.com", "short", "").is_err());
-        assert!(RealityParams::new("a.com", "b2t8JUZSOdqOImXHsGP9uAz5gfUHgrtY3i8Ihd08-Bk", "abc").is_err());
+        assert!(RealityParams::new("a.com", "IOgFivZsFuwtRLTOWITOD-PNuXxHUnkgzsqdgtfOM4Y", "abc").is_err());
     }
 
     #[test]

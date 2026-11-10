@@ -318,7 +318,7 @@ fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     let file = log_dir().and_then(|dir| {
         std::fs::create_dir_all(&dir).ok()?;
-        std::fs::OpenOptions::new().create(true).append(true).open(dir.join("veil.log")).ok()
+        open_log(&dir.join("veil.log")).ok()
     });
     match file {
         Some(f) => tracing_subscriber::fmt()
@@ -327,6 +327,48 @@ fn init_logging() {
             .with_writer(std::sync::Mutex::new(f))
             .init(),
         None => tracing_subscriber::fmt().with_env_filter(filter).init(),
+    }
+}
+
+/// Opens the log for appending; on unix it is private (0600), also when it already existed,
+/// since error messages may name servers and subscriptions.
+fn open_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let file = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+#[cfg(all(test, unix))]
+mod log_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn log_file_is_private() {
+        let dir = std::env::temp_dir().join(format!("veil-log-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let fresh = dir.join("veil.log");
+        drop(super::open_log(&fresh).unwrap());
+        assert_eq!(mode(&fresh), 0o600);
+        // An existing world-readable log is tightened and appended to, not truncated.
+        let old = dir.join("old.log");
+        std::fs::write(&old, b"line\n").unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o644)).unwrap();
+        {
+            use std::io::Write;
+            super::open_log(&old).unwrap().write_all(b"more\n").unwrap();
+        }
+        assert_eq!(mode(&old), 0o600);
+        assert_eq!(std::fs::read(&old).unwrap(), b"line\nmore\n");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 

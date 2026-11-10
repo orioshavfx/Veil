@@ -60,13 +60,32 @@ impl ServiceBackup {
 
 /// Writes a backup so that a crash never leaves a truncated file behind: temp file in the
 /// same directory, fsync, rename over the target.
+///
+/// Backups are read back (and may be written) by the root helper, so the temp file is always
+/// a fresh one: whatever sits at the temp path is unlinked first (a symlink itself, never its
+/// target), then the file is created with `O_CREAT | O_EXCL | O_NOFOLLOW` and mode 0600. The
+/// rename replaces a symlink at the target path itself, not the file it points to.
 fn write_backup(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    /// `O_NOFOLLOW` from Darwin's <fcntl.h> (this module is macOS-only; the crate has no libc).
+    const O_NOFOLLOW: i32 = 0x0100;
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow::Error::from(e).context(format!("cannot remove {}", tmp.display()))),
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(O_NOFOLLOW)
+        .open(&tmp)
+        .with_context(|| format!("cannot create {}", tmp.display()))?;
     let res = (|| -> Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)?;
@@ -376,11 +395,25 @@ fn parse_dns_backup(data: &[u8]) -> Result<Vec<DnsBackup>> {
     }
 }
 
+/// Services that a DNS backup does not cover yet.
+fn missing_services<'a>(backup: &[DnsBackup], services: &'a [String]) -> Vec<&'a String> {
+    services.iter().filter(|s| !backup.iter().any(|b| &b.service == *s)).collect()
+}
+
 /// Points every enabled service's DNS at `servers`, saving the old values.
+///
+/// An existing backup holds the original values of services a previous restore could not
+/// put back; those are kept, and only services it does not list are added to it.
 pub fn dns_override(servers: &[std::net::IpAddr], backup_path: &Path) -> Result<()> {
-    if !backup_path.exists() {
-        let mut backup = Vec::new();
-        for service in services()? {
+    let targets = services()?;
+    let mut backup = match std::fs::read(backup_path) {
+        Ok(d) => parse_dns_backup(&d)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let missing: Vec<String> = missing_services(&backup, &targets).into_iter().cloned().collect();
+    if !missing.is_empty() {
+        for service in missing {
             let out = networksetup(&["-getdnsservers", &service])?;
             let servers = if out.contains("aren't any DNS Servers") {
                 Vec::new()
@@ -392,7 +425,7 @@ pub fn dns_override(servers: &[std::net::IpAddr], backup_path: &Path) -> Result<
         write_backup(backup_path, &serde_json::to_vec_pretty(&backup)?).context("cannot write DNS backup")?;
     }
     let list: Vec<String> = servers.iter().map(|s| s.to_string()).collect();
-    for service in services()? {
+    for service in targets {
         let mut args = vec!["-setdnsservers", service.as_str()];
         args.extend(list.iter().map(String::as_str));
         networksetup(&args)?;
@@ -420,24 +453,47 @@ pub fn dns_restore(backup_path: &Path) -> Result<bool> {
             return Ok(false);
         }
     };
-    for b in &backup {
+    let remaining = restore_entries(backup, |b| {
         let mut args = vec!["-setdnsservers", b.service.as_str()];
         if b.servers.is_empty() {
             args.push("Empty");
         } else {
             args.extend(b.servers.iter().map(String::as_str));
         }
-        if let Err(e) = networksetup(&args) {
-            tracing::warn!("{e:#}");
+        networksetup(&args).map(drop)
+    });
+    if remaining.is_empty() {
+        match std::fs::remove_file(backup_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
-    }
-    match std::fs::remove_file(backup_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
+    } else {
+        // Keep the original values of what failed so the next start (or helper launch)
+        // tries again instead of leaving DNS pointed at the tunnel with no record of it.
+        let names: Vec<&str> = remaining.iter().map(|b| b.service.as_str()).collect();
+        tracing::warn!("DNS of {} not restored; kept in {} for the next attempt", names.join(", "), backup_path.display());
+        if let Err(e) = write_backup(backup_path, &serde_json::to_vec_pretty(&remaining)?) {
+            // The old file still lists every service, and restoring one twice is harmless.
+            tracing::warn!("cannot shrink DNS backup: {e:#}");
+        }
     }
     flush_dns_cache();
     Ok(true)
+}
+
+/// Applies `apply` to every backup entry; returns the entries it failed on, in order.
+fn restore_entries(backup: Vec<DnsBackup>, mut apply: impl FnMut(&DnsBackup) -> Result<()>) -> Vec<DnsBackup> {
+    backup
+        .into_iter()
+        .filter(|b| match apply(b) {
+            Ok(()) => false,
+            Err(e) => {
+                tracing::warn!("{e:#}");
+                true
+            }
+        })
+        .collect()
 }
 
 pub fn flush_dns_cache() {
@@ -622,5 +678,58 @@ mod dns_tests {
         assert_eq!(std::fs::read(&p).unwrap(), b"two");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1); // no .tmp left
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_backup_never_follows_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = std::env::temp_dir().join(format!("veil-wbl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let p = dir.join("b.json");
+
+        // A symlink planted at the temp path is removed, not written through.
+        symlink(&victim, dir.join("b.json.tmp")).unwrap();
+        write_backup(&p, b"one").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert_eq!(std::fs::read(&p).unwrap(), b"one");
+        assert!(std::fs::symlink_metadata(dir.join("b.json.tmp")).is_err());
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+
+        // A symlink at the target itself is replaced, its target left alone.
+        std::fs::remove_file(&p).unwrap();
+        symlink(&victim, &p).unwrap();
+        write_backup(&p, b"two").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert!(!std::fs::symlink_metadata(&p).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&p).unwrap(), b"two");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dns_restore_keeps_only_failed_services() {
+        let backup = vec![dns("Wi-Fi", &["1.1.1.1"]), dns("USB LAN", &[]), dns("Gone", &["8.8.8.8"])];
+        let mut tried = Vec::new();
+        let left = restore_entries(backup.clone(), |b| {
+            tried.push(b.service.clone());
+            if b.service == "Wi-Fi" { Ok(()) } else { bail!("networksetup failed") }
+        });
+        assert_eq!(tried, ["Wi-Fi", "USB LAN", "Gone"]); // one failure does not stop the rest
+        assert_eq!(left, vec![dns("USB LAN", &[]), dns("Gone", &["8.8.8.8"])]);
+        // What is left round-trips through the backup file format.
+        assert_eq!(parse_dns_backup(&serde_json::to_vec_pretty(&left).unwrap()).unwrap(), left);
+        assert!(restore_entries(backup, |_| Ok(())).is_empty());
+        assert!(restore_entries(Vec::new(), |_| bail!("never called")).is_empty());
+    }
+
+    #[test]
+    fn dns_override_backs_up_only_uncovered_services() {
+        let backup = vec![dns("Wi-Fi", &["1.1.1.1"])];
+        let services = vec!["Wi-Fi".to_string(), "USB LAN".to_string()];
+        assert_eq!(missing_services(&backup, &services), vec!["USB LAN"]);
+        assert!(missing_services(&backup, &services[..1]).is_empty());
+        assert_eq!(missing_services(&[], &services).len(), 2);
     }
 }

@@ -30,6 +30,9 @@ pub async fn fetch(sub: &Subscription) -> Result<FetchedSubscription> {
         .send()
         .await
         .and_then(|r| r.error_for_status())
+        // reqwest errors print the URL, and a subscription URL usually carries an access
+        // token: keep it out of error messages (and so out of the log).
+        .map_err(reqwest::Error::without_url)
         .with_context(|| format!("fetching subscription {}", sub.name))?;
 
     let header = |name: &str| {
@@ -42,7 +45,11 @@ pub async fn fetch(sub: &Subscription) -> Result<FetchedSubscription> {
     let title = header("profile-title").map(|t| decode_title(&t));
     let update_interval_hours = header("profile-update-interval").and_then(|v| v.trim().parse().ok());
 
-    let body = resp.text().await?;
+    let body = resp
+        .text()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| format!("reading subscription {}", sub.name))?;
     let (mut profiles, skipped) = parse_body_detailed(&body);
     for p in &mut profiles {
         p.subscription_id = Some(sub.id);
@@ -108,6 +115,43 @@ pub fn is_due(sub: &Subscription) -> bool {
 mod tests {
     use super::*;
     use base64::Engine;
+
+    fn sub_at(url: String) -> Subscription {
+        Subscription {
+            id: uuid::Uuid::new_v4(),
+            name: "My VPN".into(),
+            url,
+            update_interval_hours: 12,
+            last_updated: None,
+            usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_errors_do_not_leak_the_url() {
+        use std::io::{Read, Write};
+        // HTTP error status: reqwest would print "... for url (http://...)".
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
+        let err = fetch(&sub_at(format!("http://127.0.0.1:{port}/sub/SECRET-TOKEN"))).await.unwrap_err();
+        let msg = format!("{err:#} {err:?}");
+        assert!(msg.contains("My VPN") && msg.contains("403"), "{msg}");
+        assert!(!msg.contains("SECRET-TOKEN") && !msg.contains("/sub/"), "{msg}");
+
+        // Connection refused: the listener above is gone.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let err = fetch(&sub_at(format!("http://127.0.0.1:{closed}/sub/SECRET-TOKEN"))).await.unwrap_err();
+        let msg = format!("{err:#} {err:?}");
+        assert!(msg.contains("My VPN"), "{msg}");
+        assert!(!msg.contains("SECRET-TOKEN"), "{msg}");
+    }
 
     #[test]
     fn base64_and_plain_bodies() {
