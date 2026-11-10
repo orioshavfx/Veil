@@ -1,0 +1,28 @@
+name: Release (macOS)
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install tauri-cli --locked
+      - run: bash app/fetch-geo.sh
+      - run: bash app/build.sh
+      - name: Checksum
+        working-directory: dist
+        run: shasum -a 256 Veil.zip > Veil.zip.sha256
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/Veil.zip dist/Veil.zip.sha256 \
+            --draft --prerelease --title "Veil $GITHUB_REF_NAME" \
+            --notes "Early preview. macOS on Apple Silicon. Not notarized: see README for the first launch."

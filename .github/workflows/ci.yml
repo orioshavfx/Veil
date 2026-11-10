@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Geo lists (needed by the app crate at build time)
+        run: bash app/fetch-geo.sh
+      - name: Helper binary (the app crate expects it as a sidecar at build time)
+        run: |
+          TRIPLE=$(rustc -vV | awk '/^host:/{print $2}')
+          cargo build -p veil-helper --locked
+          mkdir -p app/src-tauri/binaries
+          cp target/debug/veil-helper "app/src-tauri/binaries/veil-helper-$TRIPLE"
+      - run: cargo check --workspace --locked
+      - run: cargo clippy --workspace --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  windows:
+    runs-on: windows-latest
+    continue-on-error: true # Windows is experimental
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked -p veil-proto -p veil-config -p veil-engine -p veil-sysproxy -p veil-cli
+
+  licenses:
+    runs-on: ubuntu-latest
+    continue-on-error: true # the license allow-list in deny.toml is new
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses advisories bans sources
