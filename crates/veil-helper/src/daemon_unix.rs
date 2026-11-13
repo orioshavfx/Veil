@@ -320,7 +320,18 @@ async fn handle(req: Request, shared: &Shared, uid: u32, client_pid: u32) -> Res
                 running: s.engine.is_some(),
                 upload,
                 download,
+                standby: s.engine.as_ref().is_some_and(Engine::is_standby),
             })
+        }
+        Request::Standby { on } => {
+            let s = shared.lock().await;
+            match s.engine.as_ref() {
+                Some(engine) => {
+                    engine.set_standby(on);
+                    Response::Ok
+                }
+                None => Response::Error { message: "not running".into() },
+            }
         }
         Request::Update { server, routing, geo_dir } => {
             let geo_dir = match stage_geo(geo_dir, uid).await {

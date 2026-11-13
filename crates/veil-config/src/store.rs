@@ -27,6 +27,10 @@ pub struct Settings {
     /// User rules, checked before the preset's rules.
     #[serde(default)]
     pub custom_rules: Vec<crate::routing::RoutingRule>,
+    /// TUN mode (macOS): "Disconnect" puts the tunnel on standby instead of removing it, so
+    /// connections that would go through the VPN are refused instead of leaking out directly.
+    #[serde(default)]
+    pub kill_switch: bool,
 }
 
 impl Default for Settings {
@@ -37,6 +41,7 @@ impl Default for Settings {
             set_system_proxy: true,
             routing_preset: "global".into(),
             custom_rules: Vec::new(),
+            kill_switch: false,
         }
     }
 }
@@ -191,6 +196,17 @@ mod tests {
         assert!(!dir.join("state.json.tmp").exists());
         assert!(store.load().unwrap().profiles.is_empty());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn kill_switch_defaults_off_for_old_settings() {
+        let old = r#"{"settings":{"mixed_port":2080,"mode":"tun","set_system_proxy":true,"routing_preset":"global"}}"#;
+        let state: AppState = serde_json::from_str(old).unwrap();
+        assert!(!state.settings.kill_switch);
+        assert!(!Settings::default().kill_switch);
+        let s = Settings { kill_switch: true, ..Settings::default() };
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(back.kill_switch);
     }
 
     #[test]

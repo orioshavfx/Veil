@@ -51,9 +51,12 @@ function render() {
   document.body.classList.toggle('busy', Boolean(busyLabel));
   const hero = $('hero');
   hero.classList.toggle('on', s.connected);
+  hero.classList.toggle('standby', !s.connected && s.standby);
   hero.classList.toggle('busy', Boolean(busyLabel));
+  // On standby the power button connects (leaves standby); it never turns the block off.
   $('power').setAttribute('aria-label', s.connected ? 'Disconnect' : 'Connect');
-  $('status').textContent = busyLabel || (s.connected ? `Connected · ${clock(seconds)}` : 'Disconnected');
+  $('status').textContent = busyLabel || (s.connected ? `Connected · ${clock(seconds)}` : s.standby ? 'Standby' : 'Disconnected');
+  $('status').title = !s.connected && s.standby ? 'VPN traffic is blocked until you connect. Quit Veil to restore normal internet.' : '';
   $('server').textContent = s.server_name || 'No server selected';
   const cur = s.current;
   $('cur-dot').className = `dot ${cur ? cur.level : 'unknown'}`;

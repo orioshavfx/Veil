@@ -145,8 +145,13 @@ function render() {
   // Main screen.
   const hero = $('hero');
   hero.classList.toggle('on', s.connected);
+  hero.classList.toggle('standby', !s.connected && s.standby);
   hero.classList.toggle('busy', Boolean(busyLabel));
-  $('status').textContent = busyLabel || (s.connected ? 'Connected' : 'Disconnected');
+  $('status').textContent = busyLabel
+    || (s.connected ? 'Connected' : s.standby ? 'Standby — VPN traffic blocked' : 'Disconnected');
+  $('status').title = !s.connected && s.standby
+    ? 'Sites and apps that use the VPN are blocked until you connect again. Quit Veil to restore normal internet.'
+    : '';
   $('power').setAttribute('aria-label', s.connected ? 'Disconnect' : 'Connect');
   const current = s.profiles.find((p) => p.id === s.selected);
   setName($('current'), current ? current.name : 'No server selected');
@@ -165,6 +170,10 @@ function render() {
     b.disabled = b.dataset.mode === 'tun' && !s.tun_available && s.mode !== 'tun';
   }
   $('mode-desc').textContent = (MODE_DESC[s.platform] || MODE_DESC.macos)[s.mode];
+  const killShown = s.standby_available && s.tun_available && s.mode === 'tun';
+  $('kill-switch-row').hidden = !killShown;
+  $('kill-switch-desc').hidden = !killShown;
+  $('kill-switch').checked = Boolean(s.kill_switch);
   if ($('routing').children.length !== s.presets.length) {
     $('routing').replaceChildren(...s.presets.map(([name, label]) => {
       const b = el('button', null, label);
@@ -295,6 +304,13 @@ $('mode').onclick = (e) => {
   const mode = e.target.dataset?.mode;
   if (!mode || mode === state.mode) return;
   action(state.connected ? 'Reconnecting…' : null, () => call('set_mode', { mode }));
+};
+
+$('kill-switch').onchange = (e) => {
+  const enabled = e.target.checked;
+  // Another action is running: action() would drop this one, so undo the click.
+  if (busy) { e.target.checked = !enabled; return; }
+  action(null, () => call('set_kill_switch', { enabled }));
 };
 
 $('routing').onclick = (e) => {
@@ -500,7 +516,8 @@ async function tick() {
       if (!busy && ++idleTicks >= 3) {
         idleTicks = 0;
         const s = await invoke('snapshot');
-        if (!busy && (s.connected !== state?.connected || (s.error ?? null) !== (state?.error ?? null))) {
+        if (!busy && (s.connected !== state?.connected || s.standby !== state?.standby
+            || (s.error ?? null) !== (state?.error ?? null))) {
           state = s;
           render();
           showBackendError();

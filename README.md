@@ -16,6 +16,12 @@ A VPN / proxy client for macOS, written in Rust with a [Tauri 2](https://tauri.a
   Installs a small root helper (`dev.veil.helper`) and asks for an administrator password once.
   Follows network changes (Wi-Fi switch, new gateway or DNS).
 - Menu bar panel: connect/disconnect, current server and its ping, pinned servers.
+- Optional kill switch for rules (TUN mode, macOS; off by default, Settings → "Block sites that
+  use VPN while it is off"): while Veil is open and disconnected, connections that the rules send
+  through the VPN are blocked instead of going out directly; direct ones keep working. Quit Veil
+  to restore normal internet. Limits: TUN mode only; a connection to a bare IP address (no domain
+  name, e.g. hard-coded in an app) is not matched against domain rules, only against IP rules
+  and the routing preset.
 
 The interface is English only.
 

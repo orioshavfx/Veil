@@ -38,7 +38,12 @@ TUN mode installs `dev.veil.helper`, a launchd daemon that runs as root and keep
    `networksetup -setdnsservers <service> Empty`.
 5. **`veil-cli run --tun` with `sudo`** (debug CLI) makes root read and write files in your user data
    directory. Do not use it on multi-user machines. Use the app instead.
-6. **Local proxy port without authentication.** In Proxy mode and in the helper, the local
+6. **Standby (kill switch) only holds while the app and the helper run.** It lives in the helper's
+   memory. If Veil quits or crashes, the helper notices that the app is gone and removes the
+   tunnel, and traffic goes out directly again; if the helper itself dies, launchd restarts it
+   without a tunnel. Standby is not saved: Veil started again is plainly disconnected. It is a
+   convenience against accidental leaks, not a firewall.
+7. **Local proxy port without authentication.** In Proxy mode and in the helper, the local
    SOCKS/HTTP port listens on `127.0.0.1` and any local user can use it.
 
 ### Your data

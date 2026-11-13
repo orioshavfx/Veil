@@ -17,6 +17,9 @@ use crate::core::{Core, Traffic, TrayInfo, UiState};
 
 type CoreState<'a> = State<'a, Mutex<Core>>;
 
+/// The app is quitting: background checks stop (see the standby check).
+static EXITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Errors cross the IPC boundary as plain strings.
 fn msg(e: anyhow::Error) -> String {
     let m = format!("{e:#}");
@@ -122,9 +125,17 @@ fn quit_for_relaunch(app: &AppHandle, relaunch: bool) {
 
 #[tauri::command]
 async fn disconnect(app: AppHandle, core: CoreState<'_>) -> Result<(), String> {
-    core.lock().await.disconnect().await;
+    core.lock().await.turn_off().await;
     update_tray(&app).await;
     Ok(())
+}
+
+/// Kill switch (macOS TUN): "Disconnect" leaves the tunnel on standby, blocking VPN traffic.
+#[tauri::command]
+async fn set_kill_switch(app: AppHandle, core: CoreState<'_>, enabled: bool) -> Result<(), String> {
+    let r = core.lock().await.set_kill_switch(enabled).await.map_err(msg);
+    update_tray(&app).await;
+    r
 }
 
 #[tauri::command]
@@ -188,7 +199,13 @@ async fn update_tray(app: &AppHandle) {
     let core = app.state::<Mutex<Core>>();
     let info = core.lock().await.tray_info();
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let tip = if info.connected { format!("Veil — Connected: {}", info.server_name) } else { "Veil — Disconnected".into() };
+        let tip = if info.connected {
+            format!("Veil — Connected: {}", info.server_name)
+        } else if info.standby {
+            "Veil — Standby: VPN traffic blocked".into()
+        } else {
+            "Veil — Disconnected".into()
+        };
         let _ = tray.set_tooltip(Some(tip));
         let _ = tray.set_icon(Some(tray_icon(info.connected)));
         #[cfg(target_os = "macos")]
@@ -217,6 +234,8 @@ const MENU_MAX_SERVERS: usize = 20;
 fn tray_menu(app: &AppHandle, info: &TrayInfo) -> tauri::Result<Menu<tauri::Wry>> {
     let status = if info.connected {
         format!("Connected · {}", clip(&info.server_name, 40))
+    } else if info.standby {
+        "Standby · VPN traffic blocked".to_string()
     } else {
         "Disconnected".to_string()
     };
@@ -573,6 +592,7 @@ fn main() {
             list_apps,
             connect,
             disconnect,
+            set_kill_switch,
             traffic,
             ping_all,
             popover::popover_state,
@@ -616,7 +636,7 @@ fn main() {
                                 let core = app.state::<Mutex<Core>>();
                                 let mut c = core.lock().await;
                                 if c.is_connected() {
-                                    c.disconnect().await;
+                                    c.turn_off().await;
                                 } else if let Err(e) = c.connect().await {
                                     tracing::error!("{e:#}");
                                 }
@@ -711,6 +731,49 @@ fn main() {
                 });
             }
 
+            // Standby (kill switch, macOS): the helper keeps the block, so ask it every few
+            // seconds whether it still does. A helper that restarted or a TUN loop that died
+            // leaves either no network or no protection; never keep showing "Standby".
+            // Only standby is checked, the helper is queried without the core lock, and the
+            // loop ends when the app quits.
+            #[cfg(target_os = "macos")]
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use crate::core::{STANDBY_CHECK_EVERY, StandbyReply, StandbyVerdict, standby_check};
+                    let mut watched: Option<u64> = None;
+                    let mut failures = 0;
+                    loop {
+                        tokio::time::sleep(STANDBY_CHECK_EVERY).await;
+                        if EXITING.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                        let token = handle.state::<Mutex<Core>>().lock().await.standby_token();
+                        if token != watched {
+                            watched = token;
+                            failures = 0;
+                        }
+                        let Some(token) = token else { continue };
+                        let query = tokio::task::spawn_blocking(veil_helper::status);
+                        let reply = match tokio::time::timeout(Duration::from_secs(10), query).await {
+                            Ok(Ok(Ok(s))) => StandbyReply::Status { running: s.running, standby: s.standby },
+                            _ => StandbyReply::Failed,
+                        };
+                        let (verdict, in_a_row) = standby_check(reply, failures);
+                        failures = in_a_row;
+                        if reply == StandbyReply::Failed {
+                            tracing::warn!("standby check: helper did not answer ({failures} in a row)");
+                        }
+                        if verdict == StandbyVerdict::Lost && !EXITING.load(std::sync::atomic::Ordering::SeqCst) {
+                            let lost = handle.state::<Mutex<Core>>().lock().await.standby_lost(token).await;
+                            if lost {
+                                update_tray(&handle).await;
+                            }
+                        }
+                    }
+                });
+            }
+
             // Started elevated by the app itself (Windows TUN): connect right away.
             if connect_tun {
                 let handle = app.handle().clone();
@@ -756,12 +819,14 @@ fn main() {
         .expect("error while building Veil");
 
     // Set once the connection has been torn down, so the second exit request goes through.
+    // (`EXITING`, set on the first request, stops the background checks.)
     static CLEANED_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     app.run(|app, event| match event {
         RunEvent::ExitRequested { api, .. } => {
             if CLEANED_UP.load(std::sync::atomic::Ordering::SeqCst) {
                 return;
             }
+            EXITING.store(true, std::sync::atomic::Ordering::SeqCst);
             // Never leave the system proxy or TUN pointing at a dead process, but
             // don't block the main thread while doing it.
             api.prevent_exit();
@@ -769,7 +834,7 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 let core = app.state::<Mutex<Core>>();
                 match tokio::time::timeout(Duration::from_secs(10), core.lock()).await {
-                    Ok(mut c) => c.disconnect().await,
+                    Ok(mut c) => c.quit().await,
                     Err(_) => tracing::error!("exit: core busy for 10 s, quitting anyway"),
                 }
                 // Whatever happened above (a busy core, a teardown that failed half-way):

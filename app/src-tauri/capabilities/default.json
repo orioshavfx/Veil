@@ -20,6 +20,7 @@
     "allow-list-apps",
     "allow-connect",
     "allow-disconnect",
+    "allow-set-kill-switch",
     "allow-traffic",
     "allow-ping-all"
   ]

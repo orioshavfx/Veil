@@ -55,6 +55,11 @@
         <button data-mode="tun" role="radio">TUN</button>
       </div>
       <p class="desc" id="mode-desc"></p>
+      <label class="check" id="kill-switch-row" hidden>
+        <input type="checkbox" id="kill-switch">
+        <span>Block sites that use VPN while it is off</span>
+      </label>
+      <p class="desc" id="kill-switch-desc" hidden>TUN mode only. When you disconnect, sites and apps that the rules send through the VPN stay blocked instead of opening directly; direct sites keep working. Quit Veil to restore normal internet.</p>
     </section>
 
     <section class="card">

@@ -56,6 +56,7 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .power:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .panel.on .power { color: var(--on-accent); background: var(--accent); box-shadow: 0 4px 16px rgb(0 0 0 / 25%); }
 .panel.busy .power { animation: pulse 1.1s ease-in-out infinite; }
+.panel.standby .power { box-shadow: inset 0 0 0 2px var(--muted); }
 @keyframes pulse { 50% { box-shadow: inset 0 0 0 2px var(--accent), 0 0 0 6px rgb(128 128 128 / 20%); } }
 
 .status { flex: none; margin-top: 12px; max-width: 100%; font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

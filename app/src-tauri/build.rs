@@ -18,6 +18,7 @@ const COMMANDS: &[&str] = &[
     "list_apps",
     "connect",
     "disconnect",
+    "set_kill_switch",
     "traffic",
     "ping_all",
     "popover_state",

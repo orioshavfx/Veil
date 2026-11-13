@@ -55,9 +55,12 @@ impl Shared {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        // Subscribed before the outbound is chosen: a switch to standby from here on is seen.
+        let mut standby = self.router.standby_watch();
         let decision = self.router.decide(&dst, src.map(|a| (crate::process::Proto::Tcp, a))).await;
-        let outbound = self.router.outbound(decision.action);
+        let outbound = self.router.outbound(decision.action).inspect_err(|e| tracing::debug!("{dst}: {e}"))?;
         tracing::debug!("{dst} -> {}", outbound.name());
+        let mut via_vpn = decision.action == RouteAction::Proxy;
         let mut remote = if decision.action == RouteAction::Direct && !decision.explicit {
             // Nothing asked for "direct" explicitly: if the site does not open
             // directly (blocked DNS, reset, no route), it is probably censored.
@@ -68,8 +71,12 @@ impl Shared {
                         Ok(Err(e)) => e.to_string(),
                         _ => "timed out".to_string(),
                     };
+                    // On standby this is refused like any other VPN connection.
+                    let proxy = self.router.outbound(RouteAction::Proxy).inspect_err(|e| {
+                        tracing::debug!("{dst}: direct failed ({why}), no VPN fallback: {e}");
+                    })?;
                     tracing::info!("{dst}: direct failed ({why}), retrying via VPN");
-                    let proxy = self.router.outbound(RouteAction::Proxy);
+                    via_vpn = true;
                     proxy.connect_tcp(&dst).await.inspect_err(|e| tracing::warn!("{dst} via proxy: {e}"))?
                 }
             }
@@ -78,6 +85,11 @@ impl Shared {
                 tracing::warn!("{dst} via {}: {e}", outbound.name());
             })?
         };
+        // Standby may have been turned on while connecting: not a byte through the VPN then.
+        if via_vpn && *standby.borrow_and_update() {
+            tracing::debug!("{dst}: VPN went on standby while connecting");
+            return Err(crate::router::standby_error());
+        }
         if !first.is_empty() {
             remote.write_all(first).await?;
             self.stats.upload.fetch_add(first.len() as u64, Ordering::Relaxed);
@@ -88,20 +100,41 @@ impl Shared {
             match tokio::time::timeout(FIRST_DATA_WAIT, inbound.read(&mut buf)).await {
                 Ok(Ok(0)) | Err(_) => {}
                 Ok(Ok(n)) => {
+                    if via_vpn && *standby.borrow_and_update() {
+                        return Err(crate::router::standby_error());
+                    }
                     remote.write_all(&buf[..n]).await?;
                     self.stats.upload.fetch_add(n as u64, Ordering::Relaxed);
                 }
                 Ok(Err(e)) => return Err(e),
             }
         }
+        // A silent client: the flush alone would send the protocol header to the server.
+        if via_vpn && *standby.borrow_and_update() {
+            return Err(crate::router::standby_error());
+        }
         remote.flush().await?;
         self.stats.active.fetch_add(1, Ordering::Relaxed);
         // Bytes are counted as they move, so the speed readout updates continuously
         // instead of once when a connection closes.
         let mut counted = Counted { inner: remote, stats: &self.stats };
-        let result = copy_bidirectional(&mut inbound, &mut counted).await;
+        let result = if via_vpn {
+            // Connections through the VPN end when it goes on standby.
+            // Biased, standby first: a standby that came on while the header went out is
+            // seen before the copy can move another byte (select! polls in random order).
+            tokio::select! {
+                biased;
+                _ = standby.wait_for(|on| *on) => {
+                    tracing::debug!("{dst}: closed, VPN on standby");
+                    Err(crate::router::standby_error())
+                }
+                r = copy_bidirectional(&mut inbound, &mut counted) => r.map(|_| ()),
+            }
+        } else {
+            copy_bidirectional(&mut inbound, &mut counted).await.map(|_| ())
+        };
         self.stats.active.fetch_sub(1, Ordering::Relaxed);
-        result.map(|_| ())
+        result
     }
 }
 
@@ -229,9 +262,9 @@ impl Engine {
             tun.server_changed(&server).await;
         }
         self.shared.router.set_proxy(outbound.clone());
-        let handle = tokio::spawn(async move { outbound.warm_up().await });
-        if let Some(old) = self.warm_up.lock().unwrap_or_else(|e| e.into_inner()).replace(handle) {
-            old.abort();
+        // On standby nothing goes to the server, not even the warm-up: that waits for "off".
+        if !self.is_standby() {
+            self.spawn_warm_up(outbound);
         }
         tracing::info!("server switched to {}:{}", server.address, server.port);
         Ok(())
@@ -241,6 +274,25 @@ impl Engine {
         let rules = Rules::compile(routing, geo_dir).context("invalid routing rules")?;
         self.shared.router.set_rules(rules);
         Ok(())
+    }
+
+    /// Standby (kill switch): connections that the rules send through the VPN are refused
+    /// and those already open through it are closed; direct and blocked traffic, the TUN,
+    /// its routes and DNS stay as they are. Takes effect at once, both ways.
+    pub fn set_standby(&self, on: bool) {
+        if self.shared.router.set_standby(on) == on {
+            return;
+        }
+        tracing::info!("standby {}", if on { "on: VPN connections blocked" } else { "off" });
+        if on {
+            self.abort_warm_up();
+        } else if let Ok(proxy) = self.shared.router.outbound(RouteAction::Proxy) {
+            self.spawn_warm_up(proxy);
+        }
+    }
+
+    pub fn is_standby(&self) -> bool {
+        self.shared.router.is_standby()
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -272,6 +324,13 @@ impl Engine {
 }
 
 impl Engine {
+    fn spawn_warm_up(&self, outbound: Arc<dyn veil_proto::Outbound>) {
+        let handle = tokio::spawn(async move { outbound.warm_up().await });
+        if let Some(old) = self.warm_up.lock().unwrap_or_else(|e| e.into_inner()).replace(handle) {
+            old.abort();
+        }
+    }
+
     fn abort_warm_up(&self) {
         if let Some(h) = self.warm_up.lock().unwrap_or_else(|e| e.into_inner()).take() {
             h.abort();

@@ -10,6 +10,10 @@ First public preview. macOS is the supported platform.
 - Proxy mode (macOS system proxy) and TUN mode (root helper, asks for an administrator
   password once).
 - Menu bar panel: connect/disconnect, current server with ping, pinned servers.
+- Standby (optional kill switch for rules, macOS TUN only, off by default): with "Block sites
+  that use VPN while it is off", Disconnect keeps the tunnel and refuses every connection the
+  rules send through the VPN (also the automatic VPN fallback of "direct"); direct traffic keeps
+  working. Quitting Veil, switching to Proxy mode or turning the option off restores the network.
 - TUN follows network changes (interface, gateway, DNS).
 - Windows build exists but TUN there is untested on real machines.
 

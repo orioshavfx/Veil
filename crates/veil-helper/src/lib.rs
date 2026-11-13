@@ -33,6 +33,9 @@ pub enum Request {
     },
     Stop,
     Status,
+    /// Kill switch: `on` keeps TUN, routes and DNS but refuses every connection that would go
+    /// through the VPN (and closes those open through it); `off` lets them through again.
+    Standby { on: bool },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -45,6 +48,9 @@ pub struct Status {
     pub running: bool,
     pub upload: u64,
     pub download: u64,
+    /// The running session is on standby (see [`Request::Standby`]).
+    #[serde(default)]
+    pub standby: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,3 +89,40 @@ pub use macos::{INSTALL_PATH, PLIST_PATH, SOCKET_PATH, call, install, uninstall}
 mod windows;
 #[cfg(windows)]
 pub use windows::{call, install, uninstall};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standby_request_json() {
+        let on = serde_json::to_string(&Request::Standby { on: true }).unwrap();
+        assert_eq!(on, r#"{"cmd":"standby","on":true}"#);
+        assert!(matches!(serde_json::from_str(&on).unwrap(), Request::Standby { on: true }));
+        assert!(matches!(
+            serde_json::from_str(r#"{"cmd":"standby","on":false}"#).unwrap(),
+            Request::Standby { on: false }
+        ));
+        // What older clients send still reads the same.
+        assert!(matches!(serde_json::from_str(r#"{"cmd":"stop"}"#).unwrap(), Request::Stop));
+        assert!(matches!(serde_json::from_str(r#"{"cmd":"status"}"#).unwrap(), Request::Status));
+        // `on` is required: a bare standby request must not silently mean "off".
+        assert!(serde_json::from_str::<Request>(r#"{"cmd":"standby"}"#).is_err());
+    }
+
+    #[test]
+    fn status_without_standby_reads_as_off() {
+        // A status from an older helper.
+        let old = r#"{"version":"0.1.0+x","binary_hash":"ab","running":true,"upload":1,"download":2}"#;
+        let s: Status = serde_json::from_str(old).unwrap();
+        assert!(s.running && !s.standby);
+        assert_eq!((s.upload, s.download), (1, 2));
+        let new = Status { running: true, standby: true, ..Default::default() };
+        let back: Status = serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
+        assert!(back.standby);
+        // The new field goes over the wire with the response.
+        let resp = serde_json::to_string(&Response::Status(new)).unwrap();
+        assert!(resp.contains(r#""standby":true"#));
+        assert!(matches!(serde_json::from_str(&resp).unwrap(), Response::Status(Status { standby: true, .. })));
+    }
+}

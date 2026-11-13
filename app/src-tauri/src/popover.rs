@@ -177,6 +177,8 @@ pub struct PopoverServer {
 #[derive(Serialize)]
 pub struct PopoverState {
     connected: bool,
+    /// Disconnected, but the TUN is on standby and blocks VPN traffic (kill switch).
+    standby: bool,
     server_name: Option<String>,
     mode: ConnectionMode,
     tun_available: bool,
@@ -206,6 +208,7 @@ fn view(core: &Core) -> PopoverState {
     let current = selected.map(make);
     PopoverState {
         connected: core.is_connected(),
+        standby: core.is_standby(),
         server_name: selected.map(|p| p.name.clone()),
         mode: state.settings.mode,
         tun_available: crate::core::TUN_AVAILABLE,

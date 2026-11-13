@@ -24,6 +24,13 @@ pub struct Core {
     store: Store,
     pub state: AppState,
     conn: Option<Conn>,
+    /// `conn` is a TUN session on standby (kill switch): shown as disconnected, while the
+    /// helper keeps the tunnel and refuses everything that would go through the VPN.
+    /// Never saved: a fresh start of the app is plainly "disconnected".
+    standby: bool,
+    /// Bumped on every entry into standby, so a helper check that started before a
+    /// reconnect and a new standby cannot end the new one.
+    standby_epoch: u64,
     connected_at: Option<Instant>,
     last_error: Option<String>,
     /// Set after the app started an elevated copy of itself and should now quit.
@@ -67,6 +74,11 @@ pub struct UiState {
     preset: String,
     presets: Vec<(&'static str, &'static str)>,
     connected: bool,
+    /// Disconnected, but the TUN stays on standby and blocks VPN traffic (kill switch).
+    standby: bool,
+    /// The kill switch setting, and whether this platform offers it (macOS TUN).
+    kill_switch: bool,
+    standby_available: bool,
     error: Option<String>,
     port: u16,
     /// `macos` or `windows`, for platform-specific texts in the UI.
@@ -78,6 +90,7 @@ pub struct UiState {
 /// Snapshot of the state shown in the menu bar / tray menu.
 pub struct TrayInfo {
     pub connected: bool,
+    pub standby: bool,
     pub selected: Option<Uuid>,
     pub server_name: String,
     pub protocol: Option<&'static str>,
@@ -158,7 +171,18 @@ impl Core {
                 });
             }
         }
-        Ok(Self { store, state, conn: None, connected_at: None, last_error, relaunch: false, no_relaunch: false, elevated_started: false })
+        Ok(Self {
+            store,
+            state,
+            conn: None,
+            standby: false,
+            standby_epoch: 0,
+            connected_at: None,
+            last_error,
+            relaunch: false,
+            no_relaunch: false,
+            elevated_started: false,
+        })
     }
 
     fn save(&self) -> Result<()> {
@@ -208,7 +232,10 @@ impl Core {
             mode: self.state.settings.mode,
             preset: self.state.settings.routing_preset.clone(),
             presets: PRESETS.to_vec(),
-            connected: self.conn.is_some(),
+            connected: self.is_connected(),
+            standby: self.standby,
+            kill_switch: self.state.settings.kill_switch,
+            standby_available: STANDBY_AVAILABLE,
             error: self.last_error.clone(),
             port: self.state.settings.mixed_port,
             platform: std::env::consts::OS,
@@ -232,8 +259,31 @@ impl Core {
         self.connect().await
     }
 
+    /// Connected and carrying traffic (a session on standby is not).
     pub fn is_connected(&self) -> bool {
-        self.conn.is_some()
+        self.conn.is_some() && !self.standby
+    }
+
+    /// Disconnected, with the TUN on standby blocking VPN traffic.
+    pub fn is_standby(&self) -> bool {
+        self.standby
+    }
+
+    fn session(&self) -> Session {
+        match (&self.conn, self.standby) {
+            (None, _) => Session::Off,
+            (Some(_), false) => Session::Running,
+            (Some(_), true) => Session::Standby,
+        }
+    }
+
+    /// Whether "Disconnect" may put the session on standby: kill switch on, TUN mode, and
+    /// the TUN runs in the helper (macOS), never the in-app engine (Windows).
+    fn standby_allowed(&self) -> bool {
+        STANDBY_AVAILABLE
+            && self.state.settings.kill_switch
+            && self.state.settings.mode == ConnectionMode::Tun
+            && !matches!(self.conn, Some(Conn::Proxy { .. }))
     }
 
     /// The error of the last connection attempt (or of a TUN that died), if any.
@@ -253,7 +303,8 @@ impl Core {
             .map(|p| (p.id, p.name.clone()))
             .collect();
         TrayInfo {
-            connected: self.conn.is_some(),
+            connected: self.is_connected(),
+            standby: self.standby,
             selected: selected.map(|p| p.id),
             server_name: selected.map(|p| p.name.clone()).unwrap_or_default(),
             protocol: selected.map(|p| p.server.protocol.name()),
@@ -426,9 +477,11 @@ impl Core {
 
     pub async fn set_mode(&mut self, mode: ConnectionMode) -> Result<()> {
         let previous = self.state.settings.mode;
-        let was_connected = self.conn.is_some();
+        let was_connected = self.is_connected();
         self.state.settings.mode = mode;
         self.save()?;
+        // A session on standby ends for good when the mode leaves TUN.
+        self.settings_changed().await;
         let Err(e) = self.reconnect_if_connected().await else { return Ok(()) };
         // The new mode could not start (UAC declined, wintun.dll missing, ...): go back to the
         // old mode and its connection, so the user is not left offline with a mode that cannot work.
@@ -493,8 +546,25 @@ impl Core {
         Ok(())
     }
 
+    /// Turns the kill switch on or off. Off while on standby: the tunnel is removed and the
+    /// system is back to normal at once.
+    pub async fn set_kill_switch(&mut self, on: bool) -> Result<()> {
+        self.state.settings.kill_switch = on;
+        self.save()?;
+        self.settings_changed().await;
+        Ok(())
+    }
+
+    /// After a change of mode or kill switch: a standby that is no longer allowed ends.
+    async fn settings_changed(&mut self) {
+        if plan(self.session(), UserEvent::SettingsChanged, self.standby_allowed()) == Step::Stop {
+            tracing::info!("standby no longer allowed by the settings: stopping TUN");
+            self.disconnect().await;
+        }
+    }
+
     async fn reconnect_if_connected(&mut self) -> Result<()> {
-        if self.conn.is_some() {
+        if self.is_connected() {
             self.disconnect().await;
             self.connect().await?;
         }
@@ -521,13 +591,29 @@ impl Core {
     }
 
     async fn connect_inner(&mut self) -> Result<()> {
-        if self.conn.is_some() || self.elevated_started {
+        if self.elevated_started {
             return Ok(());
         }
         let profile = self.state.selected_profile().context("add a server first")?.clone();
         let routing = self.state.settings.routing();
         if routing.uses_geo_files() && !geodata::present(self.store.dir()) {
             bail!("geoip/geosite data missing in {}; reinstall Veil", self.store.dir().display());
+        }
+        match plan(self.session(), UserEvent::Connect, self.standby_allowed()) {
+            Step::Nothing => return Ok(()),
+            Step::Resume => match self.resume(&profile.server, &routing).await {
+                Ok(()) => {
+                    self.connected_at = Some(Instant::now());
+                    return Ok(());
+                }
+                // The helper lost the session (restarted, say): start from scratch.
+                Err(e) => {
+                    tracing::warn!("cannot leave standby ({e:#}): starting the tunnel again");
+                    self.disconnect().await;
+                }
+            },
+            Step::Restart => self.disconnect().await,
+            Step::Start | Step::EnterStandby | Step::Stop => {}
         }
         let port = self.state.settings.mixed_port;
         match self.state.settings.mode {
@@ -609,10 +695,69 @@ impl Core {
         Ok(())
     }
 
+    /// Leaves standby: the current server and rules first (they may have changed while the
+    /// VPN was off), then VPN connections are let through again.
+    async fn resume(&self, server: &veil_config::ServerConfig, routing: &veil_config::RoutingConfig) -> Result<()> {
+        let update = veil_helper::Request::Update {
+            server: Some(Box::new(server.clone())),
+            routing: Some(routing.clone()),
+            geo_dir: self.store.dir().to_path_buf(),
+        };
+        tokio::task::spawn_blocking(move || {
+            helper_ok(veil_helper::call(&update)?)?;
+            helper_ok(veil_helper::call(&veil_helper::Request::Standby { on: false })?)
+        })
+        .await??;
+        tracing::info!("standby off: connected");
+        Ok(())
+    }
+
+    /// The app is quitting: everything stops, a session on standby included, and the
+    /// system gets its normal network back.
+    pub async fn quit(&mut self) {
+        if plan(self.session(), UserEvent::Quit, self.standby_allowed()) == Step::Stop {
+            self.disconnect().await;
+        }
+    }
+
+    /// The user's "Disconnect" (button, tray, panel). With the kill switch on in TUN mode the
+    /// tunnel goes on standby; if that fails, it is stopped completely, as without it:
+    /// never a blocked system that the app does not know about.
+    pub async fn turn_off(&mut self) {
+        match plan(self.session(), UserEvent::Disconnect, self.standby_allowed()) {
+            Step::EnterStandby => {
+                tracing::info!("disconnecting to standby (kill switch)");
+                let r = tokio::task::spawn_blocking(|| {
+                    helper_ok(veil_helper::call(&veil_helper::Request::Standby { on: true })?)
+                })
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r);
+                match r {
+                    Ok(()) => {
+                        self.standby = true;
+                        self.standby_epoch += 1;
+                        self.connected_at = None;
+                        tracing::info!("standby: VPN traffic blocked");
+                    }
+                    Err(e) => {
+                        tracing::error!("standby failed ({e:#}): stopping TUN instead");
+                        self.disconnect().await;
+                    }
+                }
+            }
+            Step::Stop => self.disconnect().await,
+            _ => {}
+        }
+    }
+
+    /// Stops everything (also a session on standby) and restores the system: quitting,
+    /// switching modes, or turning the kill switch off.
     pub async fn disconnect(&mut self) {
         if self.conn.is_some() {
             tracing::info!("disconnecting");
         }
+        self.standby = false;
         match self.conn.take() {
             Some(Conn::Proxy { engine, sysproxy }) => {
                 if sysproxy && let Err(e) = veil_sysproxy::restore(&self.proxy_backup()) {
@@ -658,9 +803,33 @@ impl Core {
         dead
     }
 
+    /// The standby to watch (see [`standby_check`]), taken under the lock so the helper
+    /// query runs without it: `None` when there is no standby (or none on this platform).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn standby_token(&self) -> Option<u64> {
+        (STANDBY_AVAILABLE && self.standby && matches!(self.conn, Some(Conn::Tun))).then_some(self.standby_epoch)
+    }
+
+    /// The helper no longer holds the standby that `token` names (it stopped, restarted or
+    /// lost its TUN): stop what is left and say so instead of showing a block that is not
+    /// there. False when that standby already ended some other way.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub async fn standby_lost(&mut self, token: u64) -> bool {
+        if self.standby_token() != Some(token) {
+            return false;
+        }
+        tracing::error!("the helper no longer holds the standby: stopping TUN");
+        self.disconnect().await;
+        self.last_error = Some(STANDBY_LOST_MSG.into());
+        true
+    }
+
     /// What `traffic()` needs, taken under the lock so the query runs without it.
     pub fn traffic_source(&self) -> TrafficSource {
         let seconds = self.connected_at.map_or(0, |t| t.elapsed().as_secs());
+        if self.standby {
+            return TrafficSource::None;
+        }
         match &self.conn {
             Some(Conn::Proxy { engine, .. }) => TrafficSource::Proxy(engine.stats().clone(), seconds),
             Some(Conn::Tun) => TrafficSource::Tun(seconds),
@@ -745,6 +914,117 @@ fn skipped_note(skipped: usize) -> String {
 }
 
 pub const TUN_AVAILABLE: bool = cfg!(any(target_os = "macos", windows));
+
+/// Standby (kill switch) needs the TUN in the privileged helper: macOS only.
+pub const STANDBY_AVAILABLE: bool = cfg!(target_os = "macos");
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const STANDBY_LOST_MSG: &str = "Standby ended: the TUN helper stopped. Rule sites are no longer blocked.";
+
+/// How often the app asks the helper whether the standby still holds.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const STANDBY_CHECK_EVERY: Duration = Duration::from_secs(3);
+
+/// Failed helper queries in a row after which the standby counts as lost.
+const STANDBY_MAX_FAILURES: u32 = 2;
+
+/// The answer to one `Status` query while on standby.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StandbyReply {
+    /// The helper answered.
+    Status { running: bool, standby: bool },
+    /// No answer: not reachable, an error, a timeout.
+    Failed,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StandbyVerdict {
+    Holds,
+    Lost,
+}
+
+/// The standby watch, free of I/O: from one reply and the failures in a row before it,
+/// the verdict and the new count. A plain answer that the session is gone ends the
+/// standby at once; a single failed query does not, two in a row do.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn standby_check(reply: StandbyReply, failures: u32) -> (StandbyVerdict, u32) {
+    match reply {
+        StandbyReply::Status { running: true, standby: true } => (StandbyVerdict::Holds, 0),
+        StandbyReply::Status { .. } => (StandbyVerdict::Lost, 0),
+        StandbyReply::Failed => {
+            let failures = failures.saturating_add(1);
+            let verdict = if failures >= STANDBY_MAX_FAILURES { StandbyVerdict::Lost } else { StandbyVerdict::Holds };
+            (verdict, failures)
+        }
+    }
+}
+
+/// An `Error` answer of the helper as an error.
+fn helper_ok(resp: veil_helper::Response) -> Result<()> {
+    match resp {
+        veil_helper::Response::Error { message } => bail!("{message}"),
+        _ => Ok(()),
+    }
+}
+
+/// The connection as far as the kill switch is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Session {
+    Off,
+    Running,
+    /// TUN up, VPN traffic refused.
+    Standby,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserEvent {
+    Connect,
+    /// The user's "Disconnect".
+    Disconnect,
+    /// The app is quitting.
+    Quit,
+    /// Mode or kill switch changed.
+    SettingsChanged,
+}
+
+/// What to do with the helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Nothing,
+    /// A new session (`Start`).
+    Start,
+    /// `Standby { on: false }` (after an `Update`).
+    Resume,
+    /// `Standby { on: true }`; on failure a full stop.
+    EnterStandby,
+    /// Full `Stop`: tunnel, routes and DNS removed.
+    Stop,
+    /// `Stop`, then `Start`.
+    Restart,
+}
+
+/// The kill switch decisions, free of I/O. `standby_allowed`: kill switch on, TUN mode,
+/// TUN in the helper (see `Core::standby_allowed`).
+fn plan(session: Session, event: UserEvent, standby_allowed: bool) -> Step {
+    use {Session as S, Step as T, UserEvent as E};
+    match (event, session) {
+        (E::Connect, S::Off) => T::Start,
+        (E::Connect, S::Running) => T::Nothing,
+        (E::Connect, S::Standby) if standby_allowed => T::Resume,
+        (E::Connect, S::Standby) => T::Restart,
+        (E::Disconnect, S::Running) if standby_allowed => T::EnterStandby,
+        (E::Disconnect, S::Running) => T::Stop,
+        (E::Disconnect, S::Standby) if standby_allowed => T::Nothing,
+        (E::Disconnect, S::Standby) => T::Stop,
+        (E::Disconnect, S::Off) => T::Nothing,
+        (E::Quit, S::Off) => T::Nothing,
+        (E::Quit, _) => T::Stop,
+        (E::SettingsChanged, S::Standby) if !standby_allowed => T::Stop,
+        (E::SettingsChanged, _) => T::Nothing,
+    }
+}
 
 /// Windows: elevation check, UAC restart and the wintun.dll check.
 #[cfg(windows)]
@@ -886,6 +1166,119 @@ fn helper_binary() -> Result<PathBuf> {
         }
     }
     bail!("veil-helper not found next to {}", exe.display())
+}
+
+#[cfg(test)]
+mod standby_tests {
+    use super::{Session, Step, UserEvent, plan};
+
+    #[test]
+    fn disconnect_goes_to_standby_only_with_the_kill_switch() {
+        assert_eq!(plan(Session::Running, UserEvent::Disconnect, true), Step::EnterStandby);
+        assert_eq!(plan(Session::Running, UserEvent::Disconnect, false), Step::Stop);
+        assert_eq!(plan(Session::Off, UserEvent::Disconnect, true), Step::Nothing);
+        assert_eq!(plan(Session::Off, UserEvent::Disconnect, false), Step::Nothing);
+        // Already off (standby): a second click changes nothing; without permission it stops.
+        assert_eq!(plan(Session::Standby, UserEvent::Disconnect, true), Step::Nothing);
+        assert_eq!(plan(Session::Standby, UserEvent::Disconnect, false), Step::Stop);
+    }
+
+    #[test]
+    fn connect_resumes_from_standby() {
+        assert_eq!(plan(Session::Off, UserEvent::Connect, true), Step::Start);
+        assert_eq!(plan(Session::Off, UserEvent::Connect, false), Step::Start);
+        assert_eq!(plan(Session::Running, UserEvent::Connect, true), Step::Nothing);
+        assert_eq!(plan(Session::Standby, UserEvent::Connect, true), Step::Resume);
+        assert_eq!(plan(Session::Standby, UserEvent::Connect, false), Step::Restart);
+    }
+
+    #[test]
+    fn quit_always_stops() {
+        for allowed in [true, false] {
+            assert_eq!(plan(Session::Running, UserEvent::Quit, allowed), Step::Stop);
+            assert_eq!(plan(Session::Standby, UserEvent::Quit, allowed), Step::Stop);
+            assert_eq!(plan(Session::Off, UserEvent::Quit, allowed), Step::Nothing);
+        }
+    }
+
+    #[test]
+    fn settings_change_ends_a_standby_that_is_no_longer_allowed() {
+        // Mode switched to Proxy, or the kill switch turned off.
+        assert_eq!(plan(Session::Standby, UserEvent::SettingsChanged, false), Step::Stop);
+        assert_eq!(plan(Session::Standby, UserEvent::SettingsChanged, true), Step::Nothing);
+        // A running or stopped session is left to the mode switch itself.
+        for allowed in [true, false] {
+            assert_eq!(plan(Session::Running, UserEvent::SettingsChanged, allowed), Step::Nothing);
+            assert_eq!(plan(Session::Off, UserEvent::SettingsChanged, allowed), Step::Nothing);
+        }
+    }
+
+    #[test]
+    fn standby_holds_while_the_helper_says_so() {
+        use super::{StandbyReply as R, StandbyVerdict as V, standby_check};
+        let ok = R::Status { running: true, standby: true };
+        assert_eq!(standby_check(ok, 0), (V::Holds, 0));
+        // A good answer clears an earlier failure.
+        assert_eq!(standby_check(ok, 1), (V::Holds, 0));
+    }
+
+    #[test]
+    fn standby_ends_on_a_plain_answer_that_it_is_gone() {
+        use super::{StandbyReply as R, StandbyVerdict as V, standby_check};
+        // Helper restarted or its TUN loop died: not running.
+        assert_eq!(standby_check(R::Status { running: false, standby: false }, 0), (V::Lost, 0));
+        assert_eq!(standby_check(R::Status { running: false, standby: true }, 0), (V::Lost, 0));
+        // Running, but letting VPN traffic through: not the standby the UI shows.
+        assert_eq!(standby_check(R::Status { running: true, standby: false }, 0), (V::Lost, 0));
+    }
+
+    #[test]
+    fn standby_survives_one_failed_query_but_not_two() {
+        use super::{StandbyReply as R, StandbyVerdict as V, standby_check};
+        let (v, n) = standby_check(R::Failed, 0);
+        assert_eq!((v, n), (V::Holds, 1));
+        assert_eq!(standby_check(R::Failed, n), (V::Lost, 2));
+        // Failure, answer, failure: never two in a row.
+        let (_, n) = standby_check(R::Failed, 0);
+        let (_, n) = standby_check(R::Status { running: true, standby: true }, n);
+        assert_eq!(standby_check(R::Failed, n), (V::Holds, 1));
+        assert_eq!(standby_check(R::Failed, u32::MAX), (V::Lost, u32::MAX));
+    }
+
+    /// A check that saw an old standby must not end a new one, nor a session not on standby.
+    #[tokio::test]
+    async fn standby_lost_needs_the_current_standby() {
+        use veil_config::store::Store;
+        let dir = std::env::temp_dir().join(format!("veil-standby-lost-{}", uuid::Uuid::new_v4()));
+        let mut core = super::Core::open_store(Store::open(&dir).unwrap()).unwrap();
+        assert_eq!(core.standby_token(), None);
+        assert!(!core.standby_lost(0).await);
+        assert!(core.last_error().is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The whole decision through `Core`: which sessions may go on standby.
+    #[test]
+    fn standby_allowed_needs_kill_switch_and_tun() {
+        use veil_config::store::{ConnectionMode, Store};
+        let dir = std::env::temp_dir().join(format!("veil-standby-{}", uuid::Uuid::new_v4()));
+        let mut core = super::Core::open_store(Store::open(&dir).unwrap()).unwrap();
+        assert!(!core.state.settings.kill_switch, "off by default");
+        assert!(!core.standby_allowed());
+        core.state.settings.mode = ConnectionMode::Tun;
+        assert!(!core.standby_allowed());
+        core.state.settings.kill_switch = true;
+        assert_eq!(core.standby_allowed(), super::STANDBY_AVAILABLE);
+        core.state.settings.mode = ConnectionMode::Proxy;
+        assert!(!core.standby_allowed());
+        // Nothing runs: not connected, not on standby, and the UI says so.
+        assert_eq!(core.session(), Session::Off);
+        let snap = serde_json::to_value(core.snapshot()).unwrap();
+        assert_eq!(snap["connected"], false);
+        assert_eq!(snap["standby"], false);
+        assert_eq!(snap["kill_switch"], true);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 #[cfg(test)]
