@@ -1,0 +1,16 @@
+# Release check: is dist/Veil.app.tar.gz.sig a valid signature by the key compiled into the app?
+# Not a workspace member (its own lock file, two small dependencies), so the release workflow
+# builds it in seconds: see .github/workflows/release.yml.
+[package]
+name = "update-sig-check"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+# The same crates and versions that tauri-plugin-updater uses to check an update.
+minisign-verify = "=0.3.0"
+base64 = "=0.22.1"
+
+[workspace]

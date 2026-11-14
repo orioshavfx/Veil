@@ -24,9 +24,10 @@ pub fn call(req: &Request) -> Result<Response> {
     s.write_all(&line)?;
     let mut resp = String::new();
     BufReader::new(s).read_line(&mut resp)?;
-    let resp: Response = serde_json::from_str(&resp).context("bad response from helper")?;
+    let resp: Response = serde_json::from_str(&resp)
+        .context("bad response from the TUN helper (it may belong to another version of Veil; connect again to reinstall it)")?;
     if let Response::Error { message } = &resp {
-        bail!("{message}");
+        bail!("{}", crate::error_text(message));
     }
     Ok(resp)
 }

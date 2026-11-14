@@ -6,7 +6,7 @@ the Windows system proxy, TUN mode, site and app rules.
 
 Files: Veil.exe (the app), veil-cli.exe (command-line tool: the test script uses it,
 and Veil starts it in TUN mode to clean up if the app dies), wintun.dll (TUN driver,
-needed for TUN mode), geo\ (site/IP lists), veil-rescue.ps1 (puts the network back
+needed for TUN mode), veil-rescue.ps1 (puts the network back
 if something went wrong, see step 5). Keep them together in one folder.
 
 1. Unzip this folder anywhere (e.g. Documents\Veil).
@@ -48,6 +48,10 @@ if something went wrong, see step 5). Keep them together in one folder.
      its routes on the TUN adapter) and can be run any number of times. It writes
      veil-rescue.txt: please send that file too.
      The same from an administrator prompt: veil-cli.exe tun-cleanup
+
+Settings and profiles are kept in %APPDATA%\veil\veil\data (paste that path into
+the Explorer address bar). Optional geoip.dat / geosite.dat for geosite:/geoip:
+rules go there too; Veil does not ship or download them.
 
 6. Send back: veil-report.txt, %LOCALAPPDATA%\Veil\veil.log (paste that path
    into the Explorer address bar), veil-rescue.txt if you ran the rescue script,

@@ -8,7 +8,7 @@
 </head>
 <body>
   <header class="top">
-    <div class="brand"><span class="logo">V</span><span id="top-title">Veil</span></div>
+    <div class="brand"><span class="logo">V</span><span id="top-title">Veil</span><span class="beta" id="beta-badge" title="Beta version">Beta</span><button class="update-pill" id="update-pill" type="button" title="Open Settings → Updates" hidden><span class="dot" aria-hidden="true"></span>Update available</button></div>
     <button class="icon-top" id="open-settings" title="Settings" aria-label="Settings">
       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 2.8v2.4M12 18.8v2.4M2.8 12h2.4M18.8 12h2.4M5.5 5.5l1.7 1.7M16.8 16.8l1.7 1.7M5.5 18.5l1.7-1.7M16.8 7.2l1.7-1.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
     </button>
@@ -89,6 +89,33 @@
       <p class="hint" id="rule-hint"></p>
       <div id="rules"></div>
       <p class="empty small" id="rules-empty" hidden></p>
+    </section>
+
+    <section class="card" id="updates-card">
+      <h3>Updates</h3>
+      <div class="update-row">
+        <span class="version">Version <span id="app-version">…</span></span>
+        <button type="button" class="ghost" id="check-update" hidden>Check for updates</button>
+      </div>
+      <p class="desc" id="update-result" aria-live="polite"></p>
+      <div id="update-available" hidden>
+        <div class="notes" id="update-notes" hidden></div>
+        <button type="button" class="primary" id="install-update">Install and restart</button>
+        <div class="update-confirm" id="update-confirm" role="alertdialog" aria-labelledby="update-confirm-text" hidden>
+          <p class="desc" id="update-confirm-text">This turns the VPN off, protection (kill switch) will be off until you connect again. Install anyway?</p>
+          <div class="update-confirm-buttons">
+            <button type="button" class="primary" id="update-confirm-yes">Install anyway</button>
+            <button type="button" class="ghost" id="update-confirm-no">Cancel</button>
+          </div>
+        </div>
+      </div>
+      <div class="progress" id="update-progress" hidden><div class="bar" id="update-bar"></div></div>
+      <p class="desc" id="update-phase" aria-live="polite" hidden></p>
+      <label class="check" id="check-updates-row" hidden>
+        <input type="checkbox" id="check-updates">
+        <span>Check for updates at startup</span>
+      </label>
+      <p class="desc" id="updates-desc" hidden>Veil asks github.com for the latest release; an update is downloaded from GitHub (github.com and *.githubusercontent.com). GitHub sees your IP address (your real one if the VPN is not connected at that moment) and the user agent “tauri-plugin-updater”. Your Veil version, servers and settings are not sent.</p>
     </section>
   </main>
 

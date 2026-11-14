@@ -424,7 +424,7 @@ async fn serve(mut conn: UnixStream, allowed_uid: u32, shared: Shared) -> Result
     }
     let resp = match serde_json::from_str::<Request>(&line) {
         Ok(req) => handle(req, &shared, uid, client_pid).await,
-        Err(e) => Response::Error { message: format!("bad request: {e}") },
+        Err(e) => Response::Error { message: format!("{} {e}", veil_helper::BAD_REQUEST) },
     };
     let mut out = serde_json::to_vec(&resp)?;
     out.push(b'\n');

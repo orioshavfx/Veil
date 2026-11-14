@@ -6,11 +6,11 @@ Please do **not** open a public issue. Use GitHub's private reporting: the **Sec
 **Report a vulnerability**. Include the Veil version, macOS version and steps to reproduce.
 This is a small hobby-scale project: there is no bug bounty and no guaranteed response time.
 
-Supported: the latest release only (0.1.x, macOS on Apple Silicon). The Windows build is experimental.
+Supported: the latest release only (1.0.0-beta.x, macOS on Apple Silicon). The Windows build is experimental.
 
 ## Known limitations
 
-Veil 0.1.0 has had a code review of the root helper but **no independent security audit**.
+Veil 1.0.0-beta.1 has had a code review of the root helper but **no independent security audit**.
 These are the weaknesses we know about. They are not fixed yet.
 
 ### The TUN helper runs as root
@@ -55,8 +55,63 @@ TUN mode installs `dev.veil.helper`, a launchd daemon that runs as root and keep
 
 ### Builds
 
-Release builds are ad-hoc signed and **not notarized**. Check `Veil.zip.sha256` or build from source.
-Updates are manual: there is no auto-update.
+Release builds are ad-hoc signed and **not notarized**. Check `SHA256SUMS` from the release or
+build from source.
+
+### In-app updates (macOS)
+
+- **Where from:** only `https://github.com/orioshavfx/Veil/releases/latest/download/latest.json`
+  (HTTPS, compiled into the app), and the `Veil.app.tar.gz` it names. GitHub's "latest release"
+  is the trust root for *which* version is offered; the signature decides *whether* it is installed.
+- **Signature:** every update package is signed with minisign (Tauri's updater format) by a key
+  that only the project owner has (on their own Mac and as a GitHub Actions secret; never in the
+  repository). The public key is compiled into the app (`UPDATER_PUBKEY` in
+  `app/src-tauri/src/updater.rs`). A package whose signature does not verify is not installed.
+  The signature also covers the version it was made for, and the app requires it to match the
+  announced version, so an older signed release cannot be passed off as a newer one; and only a
+  version greater than the running one is installed (no downgrades). The release workflow
+  checks the same before it publishes anything: it fails when `UPDATER_PUBKEY` is empty or when
+  the signature does not verify with it for the tagged version (`app/tools/update-sig-check`,
+  which checks the way the updater plugin does). The private key and its password are given only
+  to the signing step, never to the build.
+- **Builds without a key** (an empty `UPDATER_PUBKEY`, as in source builds) make no update
+  requests at all and say "Updates are not configured in this build".
+- **What it cannot protect against:** someone with the signing key or with write access to the
+  repository's releases and secrets can ship an update. The app bundle itself is not notarized;
+  the update keeps the same ad-hoc signature model.
+- **Order of steps:** download and signature check first (the VPN keeps running), then the VPN is
+  stopped exactly as on Quit (system proxy, DNS and routes restored, a standby included), then the
+  bundle is replaced (macOS asks for an administrator password if the folder is not writable) and
+  the app restarts. An update is not started while Veil is connecting, and only one at a time.
+  Before the download, Veil checks that it runs from an app bundle that can be replaced (not App
+  Translocation, not a read-only disk); otherwise it stops with an error and the VPN is not
+  touched. If the installation fails after the VPN was stopped, the VPN stays off (kill switch
+  included) and the app says so until you connect again.
+- **The TUN helper after an update:** the new app ships a new `veil-helper`. Before the next TUN
+  connection the app compares the running helper with the one in its bundle (SHA-256) and
+  reinstalls it if they differ, which asks for the administrator password (see item 2 above:
+  enter it only right after you installed or updated Veil). A helper of another version that
+  gets a request it does not understand answers only `bad request: unknown variant …`; the new
+  app turns that answer into a message that says to disconnect and connect again, which
+  reinstalls the helper (`error_text` in `crates/veil-helper`).
+- **Homebrew:** the cask downloads `Veil.zip` from the same GitHub release and checks its SHA-256.
+  It is marked `auto_updates`, so Homebrew leaves updates to the app.
+- **Network:** the update check is the only request Veil makes on its own (once at startup, if
+  enabled, and when you click "Check for updates"); the download follows "Install and restart".
+  Both go to github.com (downloads may be redirected to `*.githubusercontent.com`). GitHub sees
+  your IP address (the real one if the VPN is not connected at that moment) and the User-Agent
+  `tauri-plugin-updater/<version>`; the app version is not sent. The startup check can be turned
+  off in Settings → Updates.
+
+### Network requests and data files (Unreleased)
+
+Veil contains no built-in server, subscription or geo-list addresses and makes no network
+requests of its own beyond your servers, their pings, the subscription URLs you add and the
+update check described above. Geo
+lists are no longer bundled or downloaded: `geoip.dat` / `geosite.dat` are read only if you
+put them into the data folder yourself, so their source and integrity are up to you. With the
+TUN helper they are copied into a root-owned folder with the checks described in the code
+(`crates/veil-helper`).
 
 ### Not covered
 

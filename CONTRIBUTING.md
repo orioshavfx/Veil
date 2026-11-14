@@ -5,7 +5,6 @@ Bug reports and pull requests are welcome.
 ## Build and check
 
 ```
-bash app/fetch-geo.sh          # geo lists, not stored in git
 cargo check --workspace --locked
 cargo clippy --workspace --locked
 cargo test --workspace --locked

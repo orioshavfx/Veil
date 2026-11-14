@@ -61,6 +61,24 @@ pub enum Response {
     Error { message: String },
 }
 
+/// Prefix of the daemon's answer to a request it cannot parse (see `daemon_unix`).
+pub const BAD_REQUEST: &str = "bad request:";
+
+/// The helper's `Error` message as the app shows it. The app reinstalls a helper that is not
+/// the one it ships before starting TUN, so a mismatch should not happen; if a helper from
+/// another Veil build is still asked something it does not know, say what to do instead of
+/// showing serde's "unknown variant" alone.
+pub fn error_text(message: &str) -> String {
+    if message.starts_with(BAD_REQUEST) {
+        format!(
+            "The installed TUN helper belongs to a different version of Veil and did not understand the request. \
+             Disconnect and connect again to reinstall it (macOS asks for an administrator password). ({message})"
+        )
+    } else {
+        message.to_string()
+    }
+}
+
 pub fn status() -> Result<Status> {
     match call(&Request::Status)? {
         Response::Status(s) => Ok(s),
@@ -108,6 +126,24 @@ mod tests {
         assert!(matches!(serde_json::from_str(r#"{"cmd":"status"}"#).unwrap(), Request::Status));
         // `on` is required: a bare standby request must not silently mean "off".
         assert!(serde_json::from_str::<Request>(r#"{"cmd":"standby"}"#).is_err());
+    }
+
+    #[test]
+    fn unknown_requests_get_an_explained_error() {
+        // What an older helper does with a request it does not know (daemon_unix): it
+        // answers with an error, and the app turns that into advice.
+        let e = serde_json::from_str::<Request>(r#"{"cmd":"something_newer","x":1}"#).unwrap_err();
+        let answer = format!("{BAD_REQUEST} {e}");
+        let shown = error_text(&answer);
+        assert!(shown.contains("different version of Veil"), "{shown}");
+        assert!(shown.contains("connect again"));
+        assert!(shown.contains("something_newer"));
+        // Other errors pass through unchanged.
+        assert_eq!(error_text("not running"), "not running");
+        // A `Status` from an older helper without `binary_hash` never matches the shipped
+        // binary, so the app reinstalls it before starting TUN.
+        let old: Status = serde_json::from_str(r#"{"version":"0.9.0+1","running":false,"upload":0,"download":0}"#).unwrap();
+        assert!(old.binary_hash.is_empty());
     }
 
     #[test]

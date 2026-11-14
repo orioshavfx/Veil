@@ -26,6 +26,10 @@ const COMMANDS: &[&str] = &[
     "hide_popover",
     "open_main_window",
     "quit_app",
+    "update_status",
+    "check_update",
+    "install_update",
+    "set_check_updates",
 ];
 
 fn main() {

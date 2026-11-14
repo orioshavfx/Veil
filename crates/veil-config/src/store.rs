@@ -22,15 +22,29 @@ pub struct Settings {
     pub mixed_port: u16,
     pub mode: ConnectionMode,
     pub set_system_proxy: bool,
-    /// Name of a preset from [`crate::routing::PRESETS`].
+    /// Base routing mode from [`crate::routing::PRESETS`] (`global` or
+    /// `selected-only`). Older versions saved other names; those act as `global`.
+    #[serde(default = "default_routing_preset")]
     pub routing_preset: String,
-    /// User rules, checked before the preset's rules.
+    /// User rules, checked before the base mode's rules.
     #[serde(default)]
     pub custom_rules: Vec<crate::routing::RoutingRule>,
     /// TUN mode (macOS): "Disconnect" puts the tunnel on standby instead of removing it, so
     /// connections that would go through the VPN are refused instead of leaking out directly.
     #[serde(default)]
     pub kill_switch: bool,
+    /// macOS: ask GitHub once per start whether a newer release exists (the only request
+    /// the app makes on its own; no telemetry). On unless the user turns it off.
+    #[serde(default = "default_true")]
+    pub check_updates: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_routing_preset() -> String {
+    "global".into()
 }
 
 impl Default for Settings {
@@ -39,9 +53,10 @@ impl Default for Settings {
             mixed_port: 2080,
             mode: ConnectionMode::Proxy,
             set_system_proxy: true,
-            routing_preset: "global".into(),
+            routing_preset: default_routing_preset(),
             custom_rules: Vec::new(),
             kill_switch: false,
+            check_updates: true,
         }
     }
 }
@@ -59,10 +74,19 @@ pub struct AppState {
 }
 
 impl Settings {
-    /// Custom rules followed by the selected preset.
+    /// The base mode actually used: `routing_preset` if it is one of
+    /// [`crate::routing::PRESETS`], otherwise `global` (e.g. an old, removed preset).
+    pub fn routing_mode(&self) -> &'static str {
+        crate::routing::PRESETS
+            .iter()
+            .find(|(n, _)| *n == self.routing_preset)
+            .map_or("global", |(n, _)| *n)
+    }
+
+    /// Custom rules followed by the base mode's rules (`global` for an unknown name).
     pub fn routing(&self) -> crate::routing::RoutingConfig {
-        let mut cfg = crate::routing::RoutingConfig::preset(&self.routing_preset)
-            .unwrap_or_else(|| crate::routing::RoutingConfig::preset("global").unwrap());
+        let mut cfg = crate::routing::RoutingConfig::preset(self.routing_mode())
+            .expect("routing_mode() returns a name from PRESETS");
         cfg.rules.splice(0..0, self.custom_rules.iter().cloned());
         cfg
     }
@@ -210,6 +234,19 @@ mod tests {
     }
 
     #[test]
+    fn update_checks_default_on_for_old_settings() {
+        // Saved by a version without the setting.
+        let old = r#"{"mixed_port":2080,"mode":"proxy","set_system_proxy":true}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert!(s.check_updates);
+        assert!(Settings::default().check_updates);
+        // Turned off, it stays off.
+        let off = Settings { check_updates: false, ..Settings::default() };
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!back.check_updates);
+    }
+
+    #[test]
     fn selected_only_preset() {
         use crate::routing::{RouteAction, RoutingRule};
         let settings = Settings {
@@ -221,6 +258,39 @@ mod tests {
         assert_eq!(r.final_action, RouteAction::Direct);
         assert_eq!(r.rules.len(), 1);
         assert_eq!(r.rules[0].action, RouteAction::Proxy);
+    }
+
+    #[test]
+    fn routing_mode_is_the_mode_in_use() {
+        for (name, want) in [("global", "global"), ("selected-only", "selected-only"), ("ru-direct", "global"), ("", "global")] {
+            let s = Settings { routing_preset: name.into(), ..Settings::default() };
+            assert_eq!(s.routing_mode(), want, "{name}");
+            assert_eq!(s.routing().final_action, crate::routing::RoutingConfig::preset(want).unwrap().final_action);
+        }
+    }
+
+    #[test]
+    fn old_routing_presets_fall_back_to_global() {
+        use crate::routing::{RouteAction, RoutingConfig, RoutingRule};
+        let global = RoutingConfig::preset("global").unwrap();
+        for old in ["ru-direct", "proxy-all", "something-else"] {
+            let json = format!(
+                r#"{{"settings":{{"mixed_port":2080,"mode":"proxy","set_system_proxy":true,"routing_preset":"{old}","custom_rules":[{{"action":"direct","domain":["domain:example.com"]}}]}}}}"#
+            );
+            let state: AppState = serde_json::from_str(&json).unwrap();
+            // The saved name is kept as is (the app maps it to "global" on start) ...
+            assert_eq!(state.settings.routing_preset, old);
+            // ... and routes like "global", user rules first.
+            let r = state.settings.routing();
+            assert_eq!(r.final_action, RouteAction::Proxy);
+            assert_eq!(r.rules[0], RoutingRule::domains(RouteAction::Direct, &["domain:example.com"]));
+            assert_eq!(r.rules[1..], global.rules[..]);
+            assert!(!r.uses_geo_files());
+        }
+        // Settings without the field at all get the default.
+        let state: AppState =
+            serde_json::from_str(r#"{"settings":{"mixed_port":2080,"mode":"proxy","set_system_proxy":true}}"#).unwrap();
+        assert_eq!(state.settings.routing_preset, "global");
     }
 
     #[test]

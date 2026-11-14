@@ -1,83 +1,75 @@
-//! Downloading geoip.dat / geosite.dat.
+//! Optional, user-supplied geoip.dat / geosite.dat.
+//!
+//! Veil ships no geo lists and never downloads them. `geosite:` rules and
+//! `geoip:` rules (except the built-in `geoip:private`) work only after the user
+//! puts their own files into the data folder.
 
 use std::path::Path;
-use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
-use crate::subscription::USER_AGENT;
+use crate::routing::RoutingConfig;
 
-/// Builds that include `category-ru` and `geoip:ru`.
-pub const SOURCES: [(&str, &str); 2] = [
-    ("geoip.dat", "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"),
-    ("geosite.dat", "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"),
-];
+pub const GEOIP: &str = "geoip.dat";
+pub const GEOSITE: &str = "geosite.dat";
 
-pub fn present(dir: &Path) -> bool {
-    SOURCES.iter().all(|(name, _)| dir.join(name).exists())
+/// Geo files that `cfg` needs and `dir` does not have.
+pub fn missing(cfg: &RoutingConfig, dir: &Path) -> Vec<&'static str> {
+    [(GEOIP, cfg.uses_geoip()), (GEOSITE, cfg.uses_geosite())]
+        .into_iter()
+        .filter(|(name, needed)| *needed && !dir.join(name).is_file())
+        .map(|(name, _)| name)
+        .collect()
 }
 
-/// Copies files shipped with the app into `dir` when they are missing there.
-pub fn seed_from(bundled: &Path, dir: &Path) -> Result<bool> {
-    let mut copied = false;
-    for (name, _) in SOURCES {
-        let (src, dst) = (bundled.join(name), dir.join(name));
-        if !dst.exists() && src.exists() {
-            std::fs::copy(&src, &dst).with_context(|| format!("copying {name}"))?;
-            copied = true;
-        }
-    }
-    Ok(copied)
+/// What to tell the user when geo rules cannot work.
+pub fn missing_hint(dir: &Path) -> String {
+    format!("put {GEOIP} and {GEOSITE} into {} or remove the geoip:/geosite: rules", dir.display())
 }
 
-/// Downloads both files, replacing the old ones only after a complete download.
-pub async fn download(dir: &Path) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(300))
-        .build()?;
-    for (name, url) in SOURCES {
-        let bytes = client
-            .get(url)
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-            .map_err(reqwest::Error::without_url)
-            .with_context(|| format!("downloading {name}"))?
-            .bytes()
-            .await
-            .map_err(reqwest::Error::without_url)
-            .with_context(|| format!("downloading {name}"))?;
-        if bytes.len() < 64 * 1024 {
-            bail!("{name}: suspiciously small download ({} bytes)", bytes.len());
-        }
-        let tmp = dir.join(format!("{name}.tmp"));
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, dir.join(name))?;
-        tracing::info!("{name}: {} KiB", bytes.len() / 1024);
+/// An error naming the missing files and the folder when the rules need geo
+/// files that are not there.
+pub fn ensure_available(cfg: &RoutingConfig, dir: &Path) -> Result<()> {
+    let missing = missing(cfg, dir);
+    if missing.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    bail!("{} not found: {}", missing.join(" and "), missing_hint(dir))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routing::{RouteAction, RoutingRule};
 
     #[test]
-    fn seeds_missing_files_only() {
-        let root = std::env::temp_dir().join(format!("veil-geo-{}", uuid::Uuid::new_v4()));
-        let (bundled, dir) = (root.join("bundled"), root.join("store"));
-        std::fs::create_dir_all(&bundled).unwrap();
+    fn missing_files_are_named_with_the_folder() {
+        let dir = std::env::temp_dir().join(format!("veil-geo-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(bundled.join("geoip.dat"), b"ip").unwrap();
-        std::fs::write(bundled.join("geosite.dat"), b"site").unwrap();
-        std::fs::write(dir.join("geosite.dat"), b"newer").unwrap();
-        assert!(seed_from(&bundled, &dir).unwrap());
-        assert!(present(&dir));
-        // An existing (possibly updated) file is not overwritten.
-        assert_eq!(std::fs::read(dir.join("geosite.dat")).unwrap(), b"newer");
-        assert!(!seed_from(&bundled, &dir).unwrap());
-        std::fs::remove_dir_all(root).unwrap();
+        let cfg = |rules| RoutingConfig { rules, final_action: RouteAction::Proxy };
+        let both = cfg(vec![
+            RoutingRule::domains(RouteAction::Direct, &["geosite:example"]),
+            RoutingRule::ips(RouteAction::Direct, &["geoip:de"]),
+        ]);
+        assert_eq!(missing(&both, &dir), [GEOIP, GEOSITE]);
+        let err = format!("{:#}", ensure_available(&both, &dir).unwrap_err());
+        assert!(err.contains("geoip.dat and geosite.dat not found"), "{err}");
+        assert!(err.contains(&dir.display().to_string()), "{err}");
+        assert!(err.contains("remove the geoip:/geosite: rules"), "{err}");
+
+        // Only the file a rule needs is required.
+        std::fs::write(dir.join(GEOSITE), b"site").unwrap();
+        assert_eq!(missing(&both, &dir), [GEOIP]);
+        let site_only = cfg(vec![RoutingRule::domains(RouteAction::Proxy, &["geosite:example"])]);
+        ensure_available(&site_only, &dir).unwrap();
+
+        // The base modes and plain rules need no files at all.
+        let empty = std::env::temp_dir().join(format!("veil-geo-none-{}", uuid::Uuid::new_v4()));
+        for name in ["global", "selected-only"] {
+            ensure_available(&RoutingConfig::preset(name).unwrap(), &empty).unwrap();
+        }
+        ensure_available(&cfg(vec![RoutingRule::ips(RouteAction::Direct, &["geoip:private", "10.0.0.0/8"])]), &empty)
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

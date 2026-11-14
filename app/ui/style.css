@@ -39,6 +39,10 @@ body {
   -webkit-user-select: none; user-select: none;
 }
 button, input, select { font: inherit; color: inherit; }
+/* `hidden` must win over the display of classes like .check and .update-pill. */
+[hidden] { display: none !important; }
+/* Main-screen-only header items; hidden while Settings is open. */
+body.in-settings #beta-badge, body.in-settings #update-pill { display: none !important; }
 button { cursor: pointer; }
 
 .top {
@@ -52,6 +56,41 @@ button { cursor: pointer; }
   color: var(--on-accent); font-size: 13px; font-weight: 800;
   background: var(--accent);
 }
+.beta {
+  padding: 2px 7px; border: 1px solid var(--line); border-radius: 999px;
+  color: var(--muted); background: var(--card);
+  font-size: 10.5px; font-weight: 600; letter-spacing: .02em; line-height: 1.4;
+  white-space: nowrap; user-select: none;
+}
+
+.update-pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px;
+  background: none; color: var(--text); font-size: 10.5px; font-weight: 600; line-height: 1.4; white-space: nowrap;
+}
+.update-pill:hover { background: var(--line); }
+.update-pill .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text); }
+.update-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; }
+.update-row .version { color: var(--muted); }
+.update-row .version span { color: var(--text); font-variant-numeric: tabular-nums; }
+#updates-card button.ghost, #updates-card button.primary {
+  border-radius: 10px; padding: 6px 12px; font-size: 13px;
+}
+#updates-card button.ghost { border: 1px solid var(--line); background: var(--card); color: var(--text); }
+#updates-card button.primary { margin-top: 10px; border: 0; background: var(--accent); color: var(--on-accent); }
+#updates-card button:disabled { opacity: .5; cursor: default; }
+.update-confirm .desc { color: var(--text); }
+.update-confirm-buttons { display: flex; gap: 8px; }
+.notes {
+  margin: 10px 2px 0; max-height: 140px; overflow: auto; white-space: pre-wrap;
+  color: var(--muted); font-size: 12px; line-height: 1.45;
+  -webkit-user-select: text; user-select: text;
+}
+.selectable { -webkit-user-select: text; user-select: text; }
+.progress { margin-top: 12px; height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
+.progress .bar { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+.progress.indeterminate .bar { width: 30%; animation: slide 1.2s ease-in-out infinite; }
+@keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
 
 .seg { display: flex; padding: 2px; border-radius: 9px; background: var(--line); }
 .seg.wide { width: 100%; }

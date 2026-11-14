@@ -31,10 +31,8 @@ enum Cmd {
     Remove { index: usize },
     /// Refresh all subscriptions.
     Update,
-    /// Show routing presets, or select one.
+    /// Show the routing mode (global or selected-only) and rules, or select a mode.
     Route { preset: Option<String> },
-    /// Download fresh geoip.dat / geosite.dat.
-    GeoUpdate,
     /// Restore proxy and DNS settings saved before `run` (after a crash), and remove
     /// what a dead TUN session left behind (a TUN in use by a running Veil stays).
     RestoreProxy,
@@ -245,8 +243,10 @@ async fn main() -> Result<()> {
         }
         Cmd::Route { preset } => match preset {
             None => {
+                // Marks the mode `run` uses: an unknown (old, removed) name routes as `global`.
+                let current = state.settings.routing_mode();
                 for (name, desc) in PRESETS {
-                    let mark = if *name == state.settings.routing_preset { "*" } else { " " };
+                    let mark = if *name == current { "*" } else { " " };
                     println!("{mark} {name:<10} {desc}");
                 }
                 for r in &state.settings.custom_rules {
@@ -255,16 +255,12 @@ async fn main() -> Result<()> {
             }
             Some(name) => {
                 if !PRESETS.iter().any(|(n, _)| *n == name) {
-                    bail!("unknown preset {name}, see `veil route`");
+                    bail!("unknown routing mode {name}, see `veil route`");
                 }
                 state.settings.routing_preset = name;
                 store.save(&state)?;
             }
         },
-        Cmd::GeoUpdate => {
-            geodata::download(store.dir()).await?;
-            println!("geo data updated in {}", store.dir().display());
-        }
         Cmd::HelperInstall => {
             let exe = std::env::current_exe()?;
             let helper = exe.with_file_name("veil-helper");
@@ -309,18 +305,16 @@ async fn main() -> Result<()> {
                 None => state.selected_profile().context("no profiles, import some first")?,
             };
             let routing = state.settings.routing();
-            let uses_geo = routing.uses_geo_files();
-            if uses_geo && !geodata::present(store.dir()) {
-                println!("downloading geoip/geosite data...");
-                geodata::download(store.dir()).await?;
-            }
+            // geosite:/geoip: rules need the user's own files; Veil never downloads them.
+            geodata::ensure_available(&routing, store.dir())?;
             let port = port.unwrap_or(state.settings.mixed_port);
             let listen = SocketAddr::from(([127, 0, 0, 1], port));
             println!(
                 "using {} ({}), routing: {}",
                 p.name,
                 p.server.protocol.name(),
-                state.settings.routing_preset
+                // An old, removed preset name routes as "global".
+                state.settings.routing_mode()
             );
             let engine = Engine::start(EngineConfig {
                 listen,

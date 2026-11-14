@@ -1,5 +1,20 @@
 name: Release (macOS)
 
+# A pushed tag v<version> (the version in app/src-tauri/tauri.conf.json) builds Veil.app on
+# Apple Silicon, signs the in-app update package and publishes a GitHub release with:
+#   Veil.zip                 Homebrew cask and manual installs
+#   Veil.app.tar.gz (+.sig)  the in-app update package and its minisign signature
+#   latest.json              what the app's updater reads
+#   SHA256SUMS
+# Then it asks orioshavfx/homebrew-veil to bump the cask (needs the TAP_TOKEN secret).
+#
+# Secrets: TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD (see
+# app/tools/gen-update-key.sh), TAP_TOKEN (optional: a token allowed to run workflows in the tap).
+# The signing key and its password are given only to the "Sign the update package" step, which
+# runs nothing but the pinned tauri-cli installed before any project code ran; the build never
+# sees them. Nothing is published unless UPDATER_PUBKEY (app/src-tauri/src/updater.rs) is set
+# and the signature verifies with it (app/tools/update-sig-check, the plugin's own check).
+
 on:
   push:
     tags: ["v*"]
@@ -7,22 +22,136 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   macos:
-    runs-on: macos-latest
+    runs-on: macos-14
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Version from the tag
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          case "$TAG" in v[0-9]*) ;; *) echo "::error::tag $TAG is not v<version>"; exit 1 ;; esac
+          VERSION="${TAG#v}"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag $TAG is not a semver release version"; exit 1
+          fi
+          APP_VERSION=$(python3 -c 'import json; print(json.load(open("app/src-tauri/tauri.conf.json"))["version"])')
+          if [ "$VERSION" != "$APP_VERSION" ]; then
+            echo "::error::tag $TAG does not match the app version $APP_VERSION (tauri.conf.json)"; exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Rust toolchain
+        run: rustup update stable && rustup default stable
+
+      # An exact, locked version, installed outside the checkout (so no project config applies)
+      # into its own folder, which the Rust cache does not restore. The signing step runs this
+      # binary by its full path.
+      - name: tauri-cli
+        working-directory: ${{ runner.temp }}
+        run: |
+          cargo install tauri-cli --version =2.12.4 --locked --root "$RUNNER_TEMP/tauri-cli"
+          echo "$RUNNER_TEMP/tauri-cli/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/tauri-cli/bin/cargo-tauri" signer sign --help | grep -- '--app-version' >/dev/null
+
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install tauri-cli --locked
-      - run: bash app/fetch-geo.sh
-      - run: bash app/build.sh
-      - name: Checksum
-        working-directory: dist
-        run: shasum -a 256 Veil.zip > Veil.zip.sha256
-      - name: Draft release
+
+      # Fails before the build when the app would ship without an update key (it could then
+      # never check an update) or with something that is not a minisign public key.
+      - name: Update key is set
+        run: |
+          cargo run --locked --quiet --manifest-path app/tools/update-sig-check/Cargo.toml -- \
+            --source app/src-tauri/src/updater.rs --key-only
+
+      - name: Check the release scripts
+        run: python3 app/tools/make-latest-json.py --self-test
+
+      # No signing secrets here: build.sh leaves dist/Veil.app.tar.gz unsigned (VEIL_SIGN=0).
+      - name: Build
+        env:
+          VEIL_SIGN: "0"
+        run: bash app/build.sh
+
+      - name: Sign the update package
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::the TAURI_SIGNING_PRIVATE_KEY secret is not set: a release needs a signed update package"; exit 1
+          fi
+          rm -f dist/Veil.app.tar.gz.sig
+          # --app-version binds the signature to this version (the app requires that).
+          "$RUNNER_TEMP/tauri-cli/bin/cargo-tauri" signer sign --app-version "$VERSION" dist/Veil.app.tar.gz >/dev/null
+          test -s dist/Veil.app.tar.gz.sig
+
+      # The check an installed Veil makes before it accepts this update: the signature must
+      # verify with UPDATER_PUBKEY and carry this version. Otherwise nothing is published.
+      - name: Verify the signature with the app's key
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cargo run --locked --quiet --manifest-path app/tools/update-sig-check/Cargo.toml -- \
+            --source app/src-tauri/src/updater.rs \
+            --file dist/Veil.app.tar.gz --sig dist/Veil.app.tar.gz.sig --version "$VERSION"
+
+      - name: Release notes
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/Veil.zip dist/Veil.zip.sha256 \
-            --draft --prerelease --title "Veil $GITHUB_REF_NAME" \
-            --notes "Early preview. macOS on Apple Silicon. Not notarized: see README for the first launch."
+          # GitHub's generated notes (the same text as "Generate release notes").
+          if ! gh api "repos/$REPO/releases/generate-notes" -f tag_name="$TAG" --jq .body > notes.md; then
+            echo "::warning::could not generate release notes"
+            printf 'Veil %s\n' "$TAG" > notes.md
+          fi
+
+      - name: latest.json and checksums
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python3 app/tools/make-latest-json.py --version "$VERSION" --sig dist/Veil.app.tar.gz.sig \
+            --notes-file notes.md --out dist/latest.json
+          cd dist
+          shasum -a 256 Veil.zip Veil.app.tar.gz Veil.app.tar.gz.sig latest.json > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        # Neither --draft nor --prerelease, also for versions like 1.0.0-beta.2: the app asks
+        # releases/latest/download/latest.json, and GitHub's "latest release" skips drafts and
+        # prereleases, so such a release would never reach the installed apps.
+        run: |
+          gh release create "$TAG" \
+            dist/Veil.zip dist/Veil.app.tar.gz dist/Veil.app.tar.gz.sig dist/latest.json dist/SHA256SUMS \
+            --title "Veil $TAG" --notes-file notes.md --latest
+
+      - name: Bump the Homebrew cask
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::warning::the TAP_TOKEN secret is not set: orioshavfx/homebrew-veil was not updated"
+            exit 0
+          fi
+          SHA256=$(shasum -a 256 dist/Veil.zip | cut -d' ' -f1)
+          GH_TOKEN="$TAP_TOKEN" gh workflow run bump.yml -R orioshavfx/homebrew-veil \
+            -f version="$VERSION" -f sha256="$SHA256"

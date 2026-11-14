@@ -2,6 +2,27 @@ const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
 const $ = (id) => document.getElementById(id);
+
+// The badge names the release line of a beta (1.0.0-beta.2 → "Beta 1.0") and is hidden for a
+// stable version; the full version is in its tooltip (core:default allows app.getVersion).
+// Without a version it keeps the plain "Beta" from index.html.
+function betaBadgeText(version) {
+  const m = /^v?(\d+)\.(\d+)\.\d+(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(String(version).trim());
+  if (!m) return 'Beta';
+  if (!m[3]) return null; // stable
+  return m[3].split('.').some((id) => id.toLowerCase() === 'beta') ? `Beta ${m[1]}.${m[2]}` : `Pre-release ${m[1]}.${m[2]}`;
+}
+Promise.resolve()
+  .then(() => window.__TAURI__.app.getVersion())
+  .then((v) => {
+    const badge = $('beta-badge');
+    const text = betaBadgeText(v);
+    badge.title = `Veil ${v}`;
+    if (text) badge.textContent = text;
+    badge.hidden = !text;
+  })
+  .catch(() => {});
+
 let state = null;
 let busy = false;
 let busyLabel = null; // status text while a connection action runs
@@ -96,6 +117,7 @@ function setName(node, text) {
 async function reload() {
   state = await invoke('snapshot');
   render();
+  renderUpdates();
   showBackendError();
 }
 
@@ -130,6 +152,8 @@ function showSettings(on) {
   $('open-settings').hidden = on;
   $('close-settings').hidden = !on;
   $('top-title').textContent = on ? 'Settings' : 'Veil';
+  // The Beta badge and the update pill belong to the main screen only.
+  document.body.classList.toggle('in-settings', on);
   window.scrollTo(0, 0);
   if (on) loadRules();
 }
@@ -339,8 +363,8 @@ function setRuleKind(kind) {
   input.value = '';
   $('app-list').hidden = kind !== 'app';
   if (kind === 'site') {
-    input.placeholder = 'youtube.com, 1.2.3.0/24, geosite:netflix';
-    $('rule-hint').textContent = 'A domain covers all its subdomains; you can paste a full link. For well-known services Veil adds all their domains (CDN, video, images). Rules are checked top to bottom.';
+    input.placeholder = 'youtube.com, 1.2.3.0/24';
+    $('rule-hint').textContent = 'A domain covers all its subdomains; you can paste a full link. Rules are checked top to bottom. Optional: geosite:/geoip: lists need your own geoip.dat/geosite.dat in the data folder.';
   } else {
     input.placeholder = 'Search, or a program name (e.g. curl)';
     $('rule-hint').textContent = state.tun_available
@@ -407,7 +431,8 @@ async function rulesFromInput(text, act) {
   const entries = text.split(/[,\s]+/).map(siteEntry).filter(Boolean);
   const ip = entries.filter((e) => IP_LIKE.test(e) && !DOMAIN_PREFIXES.test(e));
   const domain = entries.filter((e) => !ip.includes(e));
-  // A site loads from many domains (CDN, video, images): add the service's list.
+  // A site loads from many domains (CDN, video, images): add the service's list,
+  // only when the user put their own geosite.dat into the data folder.
   const added = [];
   for (const d of domain.filter((x) => x.startsWith('domain:'))) {
     const code = await invoke('suggest_geosite', { domain: d.slice(7) }).catch(() => null);
@@ -544,8 +569,156 @@ async function tick() {
   }
 }
 
+// ---- settings: updates ------------------------------------------------------
+// macOS only; the backend decides (`availability`): `ready`, `not_configured` (built without
+// an update key) or `unsupported` (Windows: download new versions from the releases page).
+
+let updates = null; // UpdateStatus from the backend
+let installing = false;
+let checking = false;
+let confirming = false; // the inline "Install anyway?" is open
+
+const PHASE_TEXT = {
+  downloading: 'Downloading…',
+  stopping: 'Stopping the VPN…',
+  installing: 'Installing…',
+  restarting: 'Restarting…',
+};
+
+function renderUpdates() {
+  const u = updates;
+  if (!u) return;
+  const ready = u.availability === 'ready';
+  $('app-version').textContent = u.current_version;
+  $('check-update').hidden = !ready;
+  $('check-update').disabled = checking || installing;
+  $('check-update').textContent = checking ? 'Checking…' : 'Check for updates';
+  $('check-updates-row').hidden = !ready;
+  $('updates-desc').hidden = !ready;
+  $('update-pill').hidden = !(ready && u.available);
+  let text = '';
+  if (u.availability === 'unsupported') text = `Veil does not update itself on this system. Download new versions from ${u.releases_page}`;
+  else if (u.availability === 'not_configured') text = 'Updates are not configured in this build.';
+  else if (u.error) text = u.error;
+  else if (u.available) text = `Version ${u.available.version} is available${u.available.date ? ` (${u.available.date})` : ''}.`;
+  else if (u.checked) text = 'You are up to date.';
+  $('update-result').textContent = text;
+  $('update-result').hidden = !text;
+  $('update-result').classList.toggle('selectable', u.availability === 'unsupported');
+  const offer = ready && Boolean(u.available);
+  $('update-available').hidden = !offer;
+  const notes = u.available?.notes || '';
+  $('update-notes').textContent = notes;
+  $('update-notes').hidden = !notes;
+  $('install-update').disabled = installing || u.phase !== 'idle';
+  if (!offer || installing) confirming = false;
+  $('install-update').hidden = confirming;
+  $('update-confirm').hidden = !confirming;
+  if (state) $('check-updates').checked = Boolean(state.check_updates);
+}
+
+async function loadUpdates() {
+  try {
+    updates = await invoke('update_status');
+  } catch {
+    return;
+  }
+  renderUpdates();
+}
+
+function showPhase(p) {
+  const shown = p && p.phase !== 'idle';
+  $('update-progress').hidden = !shown;
+  $('update-phase').hidden = !shown;
+  if (!shown) return;
+  const known = p.phase === 'downloading' && p.total;
+  $('update-progress').classList.toggle('indeterminate', !known);
+  $('update-bar').style.width = known ? `${Math.min(100, (p.downloaded / p.total) * 100).toFixed(1)}%` : '';
+  let text = PHASE_TEXT[p.phase] || '';
+  if (p.phase === 'downloading' && p.downloaded) {
+    text = known
+      ? `Downloading… ${Math.floor((p.downloaded / p.total) * 100)}% of ${bytes(p.total)}`
+      : `Downloading… ${bytes(p.downloaded)}`;
+  }
+  $('update-phase').textContent = text;
+}
+
+$('check-update').onclick = async () => {
+  if (checking || installing) return;
+  checking = true;
+  renderUpdates();
+  try {
+    updates = await invoke('check_update');
+  } catch {
+    await loadUpdates(); // the backend keeps the error as `updates.error`
+  } finally {
+    checking = false;
+    renderUpdates();
+  }
+};
+
+$('install-update').onclick = () => {
+  if (installing) return;
+  // A connection is being set up: the backend refuses too, say it here first.
+  if (busy) { toast('Wait until Veil has finished connecting, then install the update.', true); return; }
+  // Installing stops the VPN (a standby too): ask first, inline (window.confirm would block
+  // the webview).
+  if (state?.connected || state?.standby) {
+    confirming = true;
+    renderUpdates();
+    $('update-confirm-no').focus();
+    return;
+  }
+  installUpdate();
+};
+$('update-confirm-yes').onclick = () => {
+  confirming = false;
+  if (busy) { renderUpdates(); toast('Wait until Veil has finished connecting, then install the update.', true); return; }
+  installUpdate();
+};
+$('update-confirm-no').onclick = () => {
+  confirming = false;
+  renderUpdates();
+  $('install-update').focus();
+};
+
+async function installUpdate() {
+  if (installing) return;
+  installing = true;
+  renderUpdates();
+  showPhase({ phase: 'downloading', downloaded: 0, total: null });
+  try {
+    await invoke('install_update'); // on success the app restarts
+  } catch (e) {
+    showPhase(null);
+    // If the VPN was already stopped, the backend keeps the same text as `state.error`
+    // (and Settings → Updates as `updates.error`): one toast is enough.
+    shownError = String(e);
+    toast(String(e), true);
+    installing = false;
+    await reload();
+    await loadUpdates();
+  }
+}
+
+$('check-updates').onchange = (e) => {
+  const enabled = e.target.checked;
+  call('set_check_updates', { enabled }).catch(() => { e.target.checked = !enabled; });
+};
+
+$('update-pill').onclick = () => {
+  showSettings(true);
+  $('updates-card').scrollIntoView({ block: 'nearest' });
+};
+
+listen('update-progress', (e) => {
+  if (installing) showPhase(e.payload);
+});
+listen('update-status', loadUpdates);
+
 setRuleKind('site');
 applySpeedToggle();
 listen('state-changed', reload);
 setInterval(tick, 1000);
 reload();
+loadUpdates();

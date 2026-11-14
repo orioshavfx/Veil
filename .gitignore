@@ -6,7 +6,7 @@ app/src-tauri/gen/
 # macOS
 .DS_Store
 
-# Geo lists: downloaded by app/fetch-geo.sh (about 10 MB, updated daily upstream)
+# Geo lists: no longer bundled; old local copies must not be committed
 app/src-tauri/resources/geoip.dat
 app/src-tauri/resources/geosite.dat
 

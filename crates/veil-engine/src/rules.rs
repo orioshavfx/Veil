@@ -6,7 +6,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use regex::RegexSet;
-use veil_config::{RouteAction, RoutingConfig, RoutingRule};
+use veil_config::{RouteAction, RoutingConfig, RoutingRule, geodata};
 
 use crate::geo::{self, DomainKind};
 
@@ -186,14 +186,14 @@ impl Rules {
         let geoip = if geoip_codes.is_empty() {
             HashMap::new()
         } else {
-            geo::load_geoip(&geo_dir.join("geoip.dat"), &geoip_codes)
-                .context("geoip rules need geoip.dat (run `veil geo update`)")?
+            geo::load_geoip(&geo_dir.join(geodata::GEOIP), &geoip_codes)
+                .with_context(|| format!("geoip: rules need geoip.dat: {}", geodata::missing_hint(geo_dir)))?
         };
         let geosite = if geosite_codes.is_empty() {
             HashMap::new()
         } else {
-            geo::load_geosite(&geo_dir.join("geosite.dat"), &geosite_codes)
-                .context("geosite rules need geosite.dat (run `veil geo update`)")?
+            geo::load_geosite(&geo_dir.join(geodata::GEOSITE), &geosite_codes)
+                .with_context(|| format!("geosite: rules need geosite.dat: {}", geodata::missing_hint(geo_dir)))?
         };
 
         let mut rules = Vec::new();
@@ -402,13 +402,21 @@ mod tests {
 
     #[test]
     fn missing_geo_file_is_reported() {
-        let cfg = RoutingConfig::preset("ru-direct").unwrap();
-        let err = Rules::compile(&cfg, Path::new("/nonexistent")).err().unwrap();
-        assert!(format!("{err:#}").contains("veil geo update"));
+        for rule in [RoutingRule::domains(Direct, &["geosite:example"]), RoutingRule::ips(Direct, &["geoip:de"])] {
+            let cfg = RoutingConfig { rules: vec![rule], final_action: Proxy };
+            let err = format!("{:#}", Rules::compile(&cfg, Path::new("/nonexistent")).err().unwrap());
+            assert!(err.contains("put geoip.dat and geosite.dat into /nonexistent"), "{err}");
+            assert!(!err.contains("veil geo update"), "{err}");
+        }
+        // The base modes compile without any geo file.
+        for name in ["global", "selected-only"] {
+            Rules::compile(&RoutingConfig::preset(name).unwrap(), Path::new("/nonexistent")).unwrap();
+        }
     }
 }
 
-/// Uses the geo files shipped with Homebrew's xray when present.
+/// User-supplied geo files: uses the ones of Homebrew's xray when present
+/// (or `VEIL_GEO_DIR`), skipped otherwise. Veil itself ships none.
 #[cfg(test)]
 mod geo_file_tests {
     use super::*;
@@ -417,24 +425,31 @@ mod geo_file_tests {
         let dir = std::path::PathBuf::from(
             std::env::var("VEIL_GEO_DIR").unwrap_or_else(|_| "/opt/homebrew/share/xray".into()),
         );
-        dir.join("geosite.dat").exists().then_some(dir)
+        (dir.join("geosite.dat").exists() && dir.join("geoip.dat").exists()).then_some(dir)
     }
 
     #[test]
-    fn ru_direct_preset() {
+    fn user_geo_rules() {
         let Some(dir) = geo_dir() else {
             eprintln!("no geo files, skipping");
             return;
         };
-        let r = Rules::compile(&RoutingConfig::preset("ru-direct").unwrap(), &dir).unwrap();
+        let cfg = RoutingConfig {
+            rules: vec![
+                RoutingRule::domains(RouteAction::Direct, &["geosite:google"]),
+                RoutingRule::ips(RouteAction::Direct, &["geoip:private"]),
+            ],
+            final_action: RouteAction::Proxy,
+        };
+        let r = Rules::compile(&cfg, &dir).unwrap();
         let m = |d: Option<&str>, ip: Option<&str>| {
             let ips: Vec<IpAddr> = ip.map(|i| i.parse().unwrap()).into_iter().collect();
             r.first_match(&Target { domain: d, ips: &ips, port: 443, process: None })
         };
-        assert_eq!(m(Some("ya.ru"), None), Some(RouteAction::Direct));
-        assert_eq!(m(Some("vk.com"), None), Some(RouteAction::Direct), "geosite:category-ru");
-        assert_eq!(m(None, Some("77.88.55.88")), Some(RouteAction::Direct), "geoip:ru (Yandex)");
-        assert_eq!(m(Some("youtube.com"), None), None);
-        assert_eq!(m(None, Some("142.250.74.14")), None);
+        assert_eq!(m(Some("www.google.com"), None), Some(RouteAction::Direct), "geosite:google");
+        assert_eq!(m(None, Some("192.168.1.1")), Some(RouteAction::Direct));
+        assert_eq!(m(Some("example.org"), None), None);
+        let bad = RoutingConfig { rules: vec![RoutingRule::domains(RouteAction::Direct, &["geosite:no-such-list-xyz"])], ..cfg };
+        assert!(Rules::compile(&bad, &dir).is_err());
     }
 }

@@ -16,11 +16,16 @@ veil-sysproxy.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+semver = "1"
 tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+
+# In-app updates from GitHub Releases: macOS only (the Windows build is a portable zip).
+[target.'cfg(target_os = "macos")'.dependencies]
+tauri-plugin-updater = "2.14"
 
 [dev-dependencies]
 base64.workspace = true

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Cross-builds the portable Windows x64 test kit on this Mac:
-# dist/windows/ (Veil.exe, veil-cli.exe, geo/, test and rescue scripts) and dist/Veil-windows-x64.zip.
+# dist/windows/ (Veil.exe, veil-cli.exe, test and rescue scripts) and dist/Veil-windows-x64.zip.
 # Needs: rustup target x86_64-pc-windows-msvc, cargo-xwin, llvm, nasm.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -16,7 +16,7 @@ cp $OUT/veil-helper.exe app/src-tauri/binaries/veil-helper-$T.exe
 cargo xwin build --release --target $T -p veil-app -p veil-cli
 
 rm -rf dist/windows dist/Veil-windows-*.zip
-mkdir -p dist/windows/geo
+mkdir -p dist/windows
 cp $OUT/veil-app.exe dist/windows/Veil.exe
 # Guard: never ship a stale exe. These strings exist only in a build with the Windows TUN code.
 for marker in "--connect-tun" "wintun.dll"; do
@@ -26,7 +26,6 @@ for marker in "--connect-tun" "wintun.dll"; do
   fi
 done
 cp $OUT/veil.exe dist/windows/veil-cli.exe  # not veil.exe: macOS file names ignore case
-cp app/src-tauri/resources/geoip.dat app/src-tauri/resources/geosite.dat dist/windows/geo/
 # wintun.dll (TUN driver) must sit next to Veil.exe; without it the kit works in Proxy mode only.
 WINTUN=app/src-tauri/resources/wintun.dll
 [ -f "$WINTUN" ] || app/fetch-wintun.sh || echo "warning: could not get wintun.dll, the kit will have no TUN mode" >&2

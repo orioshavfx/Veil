@@ -79,6 +79,8 @@ pub struct UiState {
     /// The kill switch setting, and whether this platform offers it (macOS TUN).
     kill_switch: bool,
     standby_available: bool,
+    /// Settings → Updates: check GitHub for a new version at startup (macOS).
+    check_updates: bool,
     error: Option<String>,
     port: u16,
     /// `macos` or `windows`, for platform-specific texts in the UI.
@@ -143,7 +145,8 @@ impl Core {
 
     fn open_store(store: Store) -> Result<Self> {
         let mut state = store.load()?;
-        // Older versions offered more presets; map them onto the two we keep.
+        // Older versions offered geo presets (ru-direct, proxy-all); map any name
+        // that is not one of the two base modes onto "global".
         if !PRESETS.iter().any(|(n, _)| *n == state.settings.routing_preset) {
             state.settings.routing_preset = "global".into();
             store.save(&state)?;
@@ -236,6 +239,7 @@ impl Core {
             standby: self.standby,
             kill_switch: self.state.settings.kill_switch,
             standby_available: STANDBY_AVAILABLE,
+            check_updates: self.state.settings.check_updates,
             error: self.last_error.clone(),
             port: self.state.settings.mixed_port,
             platform: std::env::consts::OS,
@@ -289,6 +293,13 @@ impl Core {
     /// The error of the last connection attempt (or of a TUN that died), if any.
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    /// Shows `msg` like a connection error (window, panel) until the next connection: an
+    /// update that failed after it had turned the VPN off.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn set_error(&mut self, msg: String) {
+        self.last_error = Some(msg);
     }
 
     /// What the tray menu shows; cheap to build, no async.
@@ -420,23 +431,14 @@ impl Core {
         self.save()
     }
 
-    /// Puts the geoip/geosite files bundled with the app in place, so rules
-    /// never wait for a slow download.
-    pub fn seed_geo(&self, bundled: &std::path::Path) {
-        match geodata::seed_from(bundled, self.store.dir()) {
-            Ok(true) => tracing::info!("geo data copied from {}", bundled.display()),
-            Ok(false) => {}
-            Err(e) => tracing::warn!("seeding geo data: {e:#}"),
-        }
-    }
-
     pub fn toggle_pin(&mut self, id: Uuid) -> Result<()> {
         let p = self.state.profiles.iter_mut().find(|p| p.id == id).context("no such profile")?;
         p.pinned = !p.pinned;
         self.save()
     }
 
-    /// A geosite list with all domains of the service `domain` belongs to.
+    /// A geosite list with all domains of the service `domain` belongs to, from
+    /// the user's own geosite.dat; `None` when there is no such file.
     pub async fn suggest_geosite(&self, domain: &str) -> Result<Option<String>> {
         let path = self.store.dir().join("geosite.dat");
         if !path.exists() {
@@ -497,7 +499,7 @@ impl Core {
 
     pub async fn set_preset(&mut self, name: &str) -> Result<()> {
         if !PRESETS.iter().any(|(n, _)| *n == name) {
-            bail!("unknown preset {name}");
+            bail!("unknown routing mode {name}");
         }
         self.state.settings.routing_preset = name.to_string();
         self.save()?;
@@ -513,9 +515,7 @@ impl Core {
         let mut settings = self.state.settings.clone();
         settings.custom_rules = rules;
         let routing = settings.routing();
-        if routing.uses_geo_files() && !geodata::present(self.store.dir()) {
-            bail!("geoip/geosite data missing in {}; reinstall Veil", self.store.dir().display());
-        }
+        geodata::ensure_available(&routing, self.store.dir())?;
         // Reject bad entries (IP typos, unknown geosite codes) before saving.
         Rules::compile(&routing, self.store.dir()).context("invalid rule")?;
         self.state.settings = settings;
@@ -528,9 +528,7 @@ impl Core {
             return Ok(());
         }
         let routing = self.state.settings.routing();
-        if routing.uses_geo_files() && !geodata::present(self.store.dir()) {
-            bail!("geoip/geosite data missing in {}; reinstall Veil", self.store.dir().display());
-        }
+        geodata::ensure_available(&routing, self.store.dir())?;
         match &self.conn {
             Some(Conn::Proxy { engine, .. }) => engine.set_routing(&routing, self.store.dir())?,
             Some(Conn::Tun) => {
@@ -555,6 +553,12 @@ impl Core {
         Ok(())
     }
 
+    /// Settings → Updates: the startup check on or off.
+    pub fn set_check_updates(&mut self, on: bool) -> Result<()> {
+        self.state.settings.check_updates = on;
+        self.save()
+    }
+
     /// After a change of mode or kill switch: a standby that is no longer allowed ends.
     async fn settings_changed(&mut self) {
         if plan(self.session(), UserEvent::SettingsChanged, self.standby_allowed()) == Step::Stop {
@@ -572,6 +576,7 @@ impl Core {
     }
 
     pub async fn connect(&mut self) -> Result<()> {
+        let _connecting = ConnectingFlag::raise();
         self.last_error = None;
         tracing::info!(
             "connecting: mode {:?}, server {:?}",
@@ -596,9 +601,7 @@ impl Core {
         }
         let profile = self.state.selected_profile().context("add a server first")?.clone();
         let routing = self.state.settings.routing();
-        if routing.uses_geo_files() && !geodata::present(self.store.dir()) {
-            bail!("geoip/geosite data missing in {}; reinstall Veil", self.store.dir().display());
-        }
+        geodata::ensure_available(&routing, self.store.dir())?;
         match plan(self.session(), UserEvent::Connect, self.standby_allowed()) {
             Step::Nothing => return Ok(()),
             Step::Resume => match self.resume(&profile.server, &routing).await {
@@ -910,6 +913,25 @@ fn skipped_note(skipped: usize) -> String {
         String::new()
     } else {
         format!(" ({skipped} more use protocols Veil does not support yet)")
+    }
+}
+
+/// A connection is being set up (`Core::connect` runs): an update does not start then.
+pub static CONNECTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Raises [`CONNECTING`] for as long as it lives (errors and early returns included).
+struct ConnectingFlag;
+
+impl ConnectingFlag {
+    fn raise() -> Self {
+        CONNECTING.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for ConnectingFlag {
+    fn drop(&mut self) {
+        CONNECTING.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1257,6 +1279,47 @@ mod standby_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Old configs with a geo preset (or any unknown name) start as "global".
+    #[test]
+    fn unknown_routing_preset_falls_back_to_global() {
+        use veil_config::store::Store;
+        for old in ["ru-direct", "proxy-all", "no-such-mode"] {
+            let dir = std::env::temp_dir().join(format!("veil-preset-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let json = format!(
+                r#"{{"settings":{{"mixed_port":2080,"mode":"proxy","set_system_proxy":true,"routing_preset":"{old}"}}}}"#
+            );
+            std::fs::write(dir.join("state.json"), json).unwrap();
+            let core = super::Core::open_store(Store::open(&dir).unwrap()).unwrap();
+            assert_eq!(core.state.settings.routing_preset, "global", "{old}");
+            let snap = serde_json::to_value(core.snapshot()).unwrap();
+            assert_eq!(snap["preset"], "global");
+            assert_eq!(snap["presets"].as_array().unwrap().len(), 2);
+            // The fix is saved, so the next start (and the CLI) sees "global" too.
+            let reloaded = Store::open(&dir).unwrap().load().unwrap();
+            assert_eq!(reloaded.settings.routing_preset, "global");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// Geo rules without the user's own geo files: a clear error, nothing saved.
+    #[tokio::test]
+    async fn geo_rules_need_user_files() {
+        use veil_config::store::Store;
+        use veil_config::{RouteAction, RoutingRule};
+        let dir = std::env::temp_dir().join(format!("veil-geo-rules-{}", uuid::Uuid::new_v4()));
+        let mut core = super::Core::open_store(Store::open(&dir).unwrap()).unwrap();
+        let err = core.set_rules(vec![RoutingRule::domains(RouteAction::Direct, &["geosite:example"])]).await.unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("geosite.dat not found"), "{err}");
+        assert!(err.contains(&format!("put geoip.dat and geosite.dat into {}", dir.display())), "{err}");
+        assert!(core.rules().is_empty(), "rejected rules must not be saved");
+        // geoip:private is built in, CIDR rules need no files.
+        core.set_rules(vec![RoutingRule::ips(RouteAction::Direct, &["geoip:private", "10.0.0.0/8"])]).await.unwrap();
+        assert_eq!(core.rules().len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The whole decision through `Core`: which sessions may go on standby.
     #[test]
     fn standby_allowed_needs_kill_switch_and_tun() {
@@ -1396,7 +1459,10 @@ mod tests {
 
         let mut core = Core::open_store(Store::open(&dir).unwrap()).unwrap();
         core.state.settings.set_system_proxy = false;
-        core.state.settings.routing_preset = "proxy-all".into();
+        // "global" sends local addresses direct; this test's servers are local, so
+        // a user rule sends them through the proxy.
+        core.state.settings.routing_preset = "global".into();
+        core.state.settings.custom_rules = vec![RoutingRule::ips(veil_config::RouteAction::Proxy, &["127.0.0.0/8"])];
         let mixed = free_port();
         core.state.settings.mixed_port = mixed;
 
@@ -1445,8 +1511,9 @@ mod tests {
 
         // Per-app rule applied to the live session: this test binary gets blocked.
         let me = std::env::current_exe().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+        let before = core.rules();
         assert!(core.set_rules(vec![RoutingRule::ips(veil_config::RouteAction::Direct, &["10.0.0.0/33"])]).await.is_err());
-        assert!(core.rules().is_empty(), "invalid rules must not be saved");
+        assert_eq!(core.rules(), before, "invalid rules must not be saved");
         core.set_rules(vec![RoutingRule::processes(veil_config::RouteAction::Block, &[&me])]).await.unwrap();
         let mut s3 = TcpStream::connect(("127.0.0.1", mixed)).await.unwrap();
         s3.write_all(format!("CONNECT {origin_addr} HTTP/1.1\r\n\r\n").as_bytes()).await.unwrap();

@@ -2,6 +2,7 @@
 
 mod core;
 mod popover;
+mod updater;
 
 use std::time::Duration;
 
@@ -18,7 +19,7 @@ use crate::core::{Core, Traffic, TrayInfo, UiState};
 type CoreState<'a> = State<'a, Mutex<Core>>;
 
 /// The app is quitting: background checks stop (see the standby check).
-static EXITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static EXITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Errors cross the IPC boundary as plain strings.
 fn msg(e: anyhow::Error) -> String {
@@ -574,8 +575,9 @@ fn main() {
     tracing::info!("Veil {} starting", env!("CARGO_PKG_VERSION"));
     let core = Core::open().expect("cannot open settings");
 
-    let app = tauri::Builder::default()
+    let app = updater::register(tauri::Builder::default())
         .manage(Mutex::new(core))
+        .manage(updater::Updates::new())
         .invoke_handler(tauri::generate_handler![
             snapshot,
             import,
@@ -600,12 +602,12 @@ fn main() {
             popover::hide_popover,
             popover::open_main_window,
             popover::quit_app,
+            updater::update_status,
+            updater::check_update,
+            updater::install_update,
+            updater::set_check_updates,
         ])
         .setup(move |app| {
-            if let Ok(dir) = app.path().resource_dir() {
-                let core = app.state::<Mutex<Core>>();
-                tauri::async_runtime::block_on(async { core.lock().await.seed_geo(&dir.join("geo")) });
-            }
             let handle = app.handle().clone();
             TrayIconBuilder::with_id(TRAY_ID)
                 .icon(tray_icon(false))
@@ -788,6 +790,9 @@ fn main() {
                 });
             }
 
+            // macOS: one quiet check for a newer release (if configured and not turned off).
+            updater::spawn_startup_check(app.handle());
+
             // Refresh subscriptions that are due, in the background.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -822,6 +827,13 @@ fn main() {
     // (`EXITING`, set on the first request, stops the background checks.)
     static CLEANED_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     app.run(|app, event| match event {
+        // The restart after an installed update (`updater::install_update`): the VPN was
+        // already stopped the way Quit does, and Tauri restarts whatever this handler does
+        // (`prevent_exit` is ignored for it). Only stop the background checks.
+        RunEvent::ExitRequested { code: Some(tauri::RESTART_EXIT_CODE), .. } => {
+            EXITING.store(true, std::sync::atomic::Ordering::SeqCst);
+            tracing::info!("restarting into the updated app");
+        }
         RunEvent::ExitRequested { api, .. } => {
             if CLEANED_UP.load(std::sync::atomic::Ordering::SeqCst) {
                 return;
