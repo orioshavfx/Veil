@@ -19,7 +19,7 @@ use crate::core::Core;
 /// Public key of the update signing key pair (the contents of `update.key.pub`, as printed by
 /// `app/tools/gen-update-key.sh`). Empty: this build has no key, updates are off and nothing
 /// is downloaded; the UI says "Updates are not configured in this build".
-pub const UPDATER_PUBKEY: &str = "";
+pub const UPDATER_PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFGMTYzMzk1QTZFNjg5OEIKUldTTGllYW1sVE1XcjdheldIWityU003MEt4dzhwSWpnRjhGLzhZZndGYWpJbUJLbUQ1UXE5N28K";
 
 /// Only HTTPS, only github.com: `releases/latest` is the newest release that is neither a
 /// draft nor a prerelease.
