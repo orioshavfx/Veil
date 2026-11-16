@@ -575,8 +575,11 @@ mod tests {
         assert_eq!(availability(true, ""), Availability::NotConfigured);
         assert_eq!(availability(true, "  \n"), Availability::NotConfigured);
         assert_eq!(availability(true, "RWQ..."), Availability::Ready);
-        // This build has no key yet: no update request may go out.
-        assert_ne!(this_build(), Availability::Ready);
+        // The shipped build has its key (a base64 minisign key file: "untrusted comment:" …):
+        // updates are on where they are supported, and nowhere else.
+        assert!(UPDATER_PUBKEY.starts_with("dW50cnVzdGVkIGNvbW1lbnQ6"));
+        let expected = if cfg!(target_os = "macos") { Availability::Ready } else { Availability::Unsupported };
+        assert_eq!(this_build(), expected);
         assert_eq!(serde_json::to_value(Availability::NotConfigured).unwrap(), "not_configured");
     }
 

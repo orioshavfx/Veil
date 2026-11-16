@@ -350,7 +350,14 @@ impl Tun {
             let _ = blocking(move || veil_sysproxy::cleanup_orphan_host_routes(gw)).await;
         }
 
-        let result = Self::bring_up(shared, &opts, state).await;
+        let result = match Self::bring_up(shared, &opts, state).await {
+            // Quitting meanwhile: take down what was set up (routes, DNS) instead of going on.
+            Ok(tun) if crate::engine::shutting_down() => {
+                tun.stop().await;
+                Err(cancelled())
+            }
+            r => r,
+        };
         if let Ok(tun) = &result {
             // From here on the system depends on this process: have someone watch it.
             #[cfg(windows)]
@@ -358,7 +365,9 @@ impl Tun {
             tun.server_changed(server).await;
             // Last, with the stack running and the server reachable around the tunnel.
             #[cfg(windows)]
-            tun.enable_nrpt().await;
+            if !crate::engine::shutting_down() {
+                tun.enable_nrpt().await;
+            }
         }
         if result.is_err() {
             dial::set_bypass(None);
@@ -371,6 +380,7 @@ impl Tun {
     /// Scoped default route, split routes and DNS override; undoes itself on failure.
     /// Returns whether a scoped default route was added.
     async fn setup_system(name: &str, phys: &str, gateway: Option<IpAddr>, opts: &TunOptions) -> Result<bool> {
+        check_not_quitting()?;
         let (name, phys) = (name.to_string(), phys.to_string());
         // Keep our own sockets (pinned to the physical interface) routable once
         // the split routes send everything else into the tunnel.
@@ -382,9 +392,17 @@ impl Tun {
             _ => false,
         };
         let undo = || undo_routes(name.clone(), phys.clone(), scoped_default);
+        if let Err(e) = check_not_quitting() {
+            undo().await;
+            return Err(e);
+        }
         let routes = opts.routes;
         let n = name.clone();
         if let Err(e) = blocking(move || veil_sysproxy::add_tun_routes(&n, routes)).await.and_then(|r| r) {
+            undo().await;
+            return Err(e);
+        }
+        if let Err(e) = check_not_quitting() {
             undo().await;
             return Err(e);
         }
@@ -495,6 +513,10 @@ impl Tun {
             let ready = blocking(move || veil_sysproxy::wait_tun_address(&n)).await.and_then(|r| r);
             if let Err(e) = &ready {
                 tracing::warn!("TUN adapter not ready: {e:#}; probing the resolver anyway");
+            }
+            if crate::engine::shutting_down() {
+                task.abort();
+                return Err(cancelled());
             }
             if !probe_dns().await {
                 task.abort();
@@ -739,6 +761,14 @@ impl Drop for DeadOnUnwind {
 }
 
 /// Runs a blocking call (PowerShell and friends) off the async workers.
+fn cancelled() -> anyhow::Error {
+    anyhow::anyhow!("cancelled: Veil is quitting")
+}
+
+fn check_not_quitting() -> Result<()> {
+    if crate::engine::shutting_down() { Err(cancelled()) } else { Ok(()) }
+}
+
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
     tokio::task::spawn_blocking(f).await.context("blocking task failed")
 }

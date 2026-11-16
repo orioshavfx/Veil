@@ -195,6 +195,19 @@ pub struct Engine {
 /// Set by the panic hook of the app or the CLI ([`note_panic`]); cleared when a TUN starts.
 pub(crate) static TUN_PANICKED: AtomicBool = AtomicBool::new(false);
 
+/// Set when the app is quitting while a connection is still being set up ([`request_shutdown`]).
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Asks a TUN that is being brought up to stop at its next step and undo what it did, so that
+/// quitting never races with a setup that goes on (and changes the system) after the cleanup.
+pub fn request_shutdown() {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+pub(crate) fn shutting_down() -> bool {
+    SHUTDOWN.load(Ordering::SeqCst)
+}
+
 /// For a panic hook: records that the process panicked, without touching the system (the
 /// hook may run on any thread, in any state). A running TUN then reports
 /// [`Engine::tun_failed`] and its owner stops it with the normal teardown.

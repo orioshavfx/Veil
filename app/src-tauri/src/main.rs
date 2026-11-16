@@ -335,7 +335,7 @@ fn log_dir() -> Option<std::path::PathBuf> {
 
 /// Log file for bug reports: veil.log in `log_dir()`.
 fn init_logging() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,ipstack=error".into());
     let file = log_dir().and_then(|dir| {
         std::fs::create_dir_all(&dir).ok()?;
         open_log(&dir.join("veil.log")).ok()
@@ -845,9 +845,18 @@ fn main() {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
                 let core = app.state::<Mutex<Core>>();
-                match tokio::time::timeout(Duration::from_secs(10), core.lock()).await {
-                    Ok(mut c) => c.quit().await,
-                    Err(_) => tracing::error!("exit: core busy for 10 s, quitting anyway"),
+                let mut guard = tokio::time::timeout(Duration::from_secs(10), core.lock()).await.ok();
+                if guard.is_none() {
+                    // A connection is still being set up (a TUN can take a minute): have it stop at
+                    // its next step and undo what it did, instead of changing the system after
+                    // the cleanup below has run.
+                    tracing::warn!("exit: core busy for 10 s, asking the connection in progress to stop");
+                    veil_engine::request_shutdown();
+                    guard = tokio::time::timeout(Duration::from_secs(40), core.lock()).await.ok();
+                }
+                match guard {
+                    Some(mut c) => c.quit().await,
+                    None => tracing::error!("exit: core still busy after 50 s, quitting anyway"),
                 }
                 // Whatever happened above (a busy core, a teardown that failed half-way):
                 // never quit with our TUN changes still in the system. Needs no core.

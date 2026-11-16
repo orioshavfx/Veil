@@ -949,6 +949,59 @@ pub fn spawn_tun_guard() {
     }
 }
 
+/// Starts `veil-cli.exe proxy-guard` for the system proxy this process has just set: it waits
+/// for this process to end, however that happens (crash, "End task"), and gives the user's
+/// original proxy settings back. Without it a killed Veil leaves the system pointing at a
+/// port nobody listens on (browsers stop working, programs that ignore the proxy do not).
+/// Without veil-cli.exe there is simply no guard; the next start of Veil restores as before.
+pub fn spawn_proxy_guard(host: &str, port: u16, backup_path: &Path) {
+    let Some(cli) = std::env::current_exe().ok().map(|e| e.with_file_name("veil-cli.exe")).filter(|p| p.is_file()) else {
+        tracing::info!("veil-cli.exe not found next to the app: no system proxy guard process");
+        return;
+    };
+    let mut cmd = Command::new(&cli);
+    cmd.args(["proxy-guard", "--pid", &std::process::id().to_string(), "--addr", &format!("{host}:{port}"), "--backup"])
+        .arg(backup_path)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    match cmd.spawn() {
+        Ok(child) => tracing::info!("system proxy guard started (pid {})", child.id()),
+        Err(e) => tracing::warn!("cannot start the system proxy guard {}: {e}", cli.display()),
+    }
+}
+
+/// The proxy guard process: blocks until process `pid` is gone, then restores the system
+/// proxy from `backup_path`, but only if it still points at `addr` (the dead process's own
+/// setting) and the backup still exists (a normal quit has restored and deleted it already).
+/// Appends the outcome to `proxy-guard.log` next to the backup.
+pub fn proxy_guard(pid: u32, addr: &str, backup_path: &Path) {
+    use std::io::Write;
+    // Not allowed to watch it: it may well be alive, so restoring could break its proxy.
+    if !process::wait_exit(pid) {
+        return;
+    }
+    let still_ours = wininet::query(&[wininet::SERVER])
+        .ok()
+        .is_some_and(|v| matches!(v.first(), Some(wininet::Value::Text(Some(t))) if t.as_str() == addr));
+    let line = if !backup_path.exists() {
+        format!("process {pid} ended: no proxy backup, nothing to restore\r\n")
+    } else if !still_ours {
+        format!("process {pid} ended: the system proxy is no longer {addr}, left alone\r\n")
+    } else {
+        match restore(backup_path) {
+            Ok(true) => format!("process {pid} ended: system proxy {addr} restored\r\n"),
+            Ok(false) => format!("process {pid} ended: nothing to restore\r\n"),
+            Err(e) => format!("process {pid} ended: could not restore the system proxy: {e:#}\r\n"),
+        }
+    };
+    let log = backup_path.with_file_name("proxy-guard.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 /// The guard process: blocks until process `pid` is gone, then cleans up what it left,
 /// unless another Veil has taken the TUN over meanwhile. Appends the outcome to
 /// `tun-guard.log` next to the journal.

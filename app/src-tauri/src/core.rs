@@ -635,6 +635,10 @@ impl Core {
                     engine.stop().await;
                     return Err(e.context("could not enable the system proxy"));
                 }
+                #[cfg(windows)]
+                if sysproxy {
+                    veil_sysproxy::spawn_proxy_guard("127.0.0.1", port, &self.proxy_backup());
+                }
                 self.conn = Some(Conn::Proxy { engine: Box::new(engine), sysproxy });
             }
             ConnectionMode::Tun => {

@@ -46,6 +46,17 @@ enum Cmd {
         #[arg(long)]
         pid: u32,
     },
+    /// Internal: wait for process PID to end, then give the system proxy ADDR back from BACKUP
+    /// (started by Veil on Windows after it sets the system proxy).
+    #[command(hide = true)]
+    ProxyGuard {
+        #[arg(long)]
+        pid: u32,
+        #[arg(long)]
+        addr: String,
+        #[arg(long)]
+        backup: std::path::PathBuf,
+    },
     /// Install or update the privileged TUN helper (asks for an admin password).
     HelperInstall,
     /// Run the local SOCKS5/HTTP proxy with the selected profile.
@@ -174,6 +185,13 @@ async fn main() -> Result<()> {
             let _ = pid;
             return Ok(());
         }
+        Cmd::ProxyGuard { pid, addr, backup } => {
+            #[cfg(windows)]
+            veil_sysproxy::proxy_guard(pid, &addr, &backup);
+            #[cfg(not(windows))]
+            let _ = (pid, addr, backup);
+            return Ok(());
+        }
         _ => {}
     }
     let store = Store::open_default()?;
@@ -294,7 +312,7 @@ async fn main() -> Result<()> {
                 std::process::exit(if report.needs_admin { 2 } else { 1 });
             }
         }
-        Cmd::TunCleanup | Cmd::TunGuard { .. } => unreachable!("handled before the settings are opened"),
+        Cmd::TunCleanup | Cmd::TunGuard { .. } | Cmd::ProxyGuard { .. } => unreachable!("handled before the settings are opened"),
         Cmd::Run { port, profile, no_sysproxy, tun } => {
             let backup = proxy_backup(&store);
             if veil_sysproxy::restore(&backup)? {
