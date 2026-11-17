@@ -37,6 +37,13 @@ pub struct Settings {
     /// the app makes on its own; no telemetry). On unless the user turns it off.
     #[serde(default = "default_true")]
     pub check_updates: bool,
+    /// Connect as soon as Veil opens (retried a few times: the network may not be up yet
+    /// right after login). Off by default.
+    #[serde(default)]
+    pub auto_connect: bool,
+    /// Start Veil (hidden, in the menu bar / tray) when the user logs in. Off by default.
+    #[serde(default)]
+    pub launch_at_login: bool,
 }
 
 fn default_true() -> bool {
@@ -57,6 +64,8 @@ impl Default for Settings {
             custom_rules: Vec::new(),
             kill_switch: false,
             check_updates: true,
+            auto_connect: false,
+            launch_at_login: false,
         }
     }
 }

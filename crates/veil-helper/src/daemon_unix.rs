@@ -358,7 +358,7 @@ async fn handle(req: Request, shared: &Shared, uid: u32, client_pid: u32) -> Res
             stop(&mut *shared.lock().await).await;
             Response::Ok
         }
-        Request::Start { server, routing, geo_dir, mixed_port, routes } => {
+        Request::Start { server, routing, geo_dir, mixed_port, routes, standby } => {
             let geo_dir = match stage_geo(geo_dir, uid).await {
                 Ok(d) => d,
                 Err(e) => return Response::Error { message: format!("{e:#}") },
@@ -378,6 +378,9 @@ async fn handle(req: Request, shared: &Shared, uid: u32, client_pid: u32) -> Res
             };
             match Engine::start(config).await {
                 Ok(engine) => {
+                    if standby {
+                        engine.set_standby(true);
+                    }
                     s.engine = Some(engine);
                     let shared = shared.clone();
                     s.watcher = Some(tokio::spawn(async move {

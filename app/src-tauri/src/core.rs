@@ -81,6 +81,9 @@ pub struct UiState {
     standby_available: bool,
     /// Settings → Updates: check GitHub for a new version at startup (macOS).
     check_updates: bool,
+    auto_connect: bool,
+    launch_at_login: bool,
+    autostart_available: bool,
     error: Option<String>,
     port: u16,
     /// `macos` or `windows`, for platform-specific texts in the UI.
@@ -240,6 +243,9 @@ impl Core {
             kill_switch: self.state.settings.kill_switch,
             standby_available: STANDBY_AVAILABLE,
             check_updates: self.state.settings.check_updates,
+            auto_connect: self.state.settings.auto_connect,
+            launch_at_login: self.state.settings.launch_at_login,
+            autostart_available: crate::autostart::AVAILABLE,
             error: self.last_error.clone(),
             port: self.state.settings.mixed_port,
             platform: std::env::consts::OS,
@@ -484,6 +490,9 @@ impl Core {
         self.save()?;
         // A session on standby ends for good when the mode leaves TUN.
         self.settings_changed().await;
+        if self.conn.is_none() {
+            self.start_in_standby().await;
+        }
         let Err(e) = self.reconnect_if_connected().await else { return Ok(()) };
         // The new mode could not start (UAC declined, wintun.dll missing, ...): go back to the
         // old mode and its connection, so the user is not left offline with a mode that cannot work.
@@ -550,7 +559,34 @@ impl Core {
         self.state.settings.kill_switch = on;
         self.save()?;
         self.settings_changed().await;
+        // Nothing connected: the block starts now, not only after the first connection.
+        if on && self.conn.is_none() {
+            self.start_in_standby().await;
+        }
         Ok(())
+    }
+
+    /// Settings → Startup: connect as soon as the app opens.
+    pub fn set_auto_connect(&mut self, on: bool) -> Result<()> {
+        self.state.settings.auto_connect = on;
+        self.save()
+    }
+
+    /// Settings → Startup: start the app at login. The system entry is changed first and the
+    /// setting follows only when that worked, so the switch never shows a state that is not real.
+    pub fn set_launch_at_login(&mut self, on: bool) -> Result<()> {
+        crate::autostart::set(on)?;
+        self.state.settings.launch_at_login = on;
+        self.save()
+    }
+
+    /// Start of the app: the autostart entry points at the app as it is now (it may have moved).
+    pub fn refresh_autostart(&self) {
+        if self.state.settings.launch_at_login
+            && let Err(e) = crate::autostart::set(true)
+        {
+            tracing::warn!("autostart entry: {e:#}");
+        }
     }
 
     /// Settings → Updates: the startup check on or off.
@@ -692,6 +728,7 @@ impl Core {
                         geo_dir: self.store.dir().to_path_buf(),
                         mixed_port: port,
                         routes: veil_helper::TunRoutes::All,
+                        standby: false,
                     };
                     tokio::task::spawn_blocking(move || veil_helper::call(&req)).await??;
                     self.conn = Some(Conn::Tun);
@@ -701,6 +738,60 @@ impl Core {
         self.connected_at = Some(Instant::now());
         Ok(())
     }
+
+    /// Kill switch on, TUN mode, nothing connected (app start, or the setting just changed):
+    /// the tunnel comes up already on standby, so VPN traffic is blocked before the first
+    /// connection as well. Quiet on purpose: it never asks for the helper password (without an
+    /// installed, current helper nothing happens) and a failure only goes to the log.
+    #[cfg(not(windows))]
+    pub async fn start_in_standby(&mut self) {
+        if !self.standby_allowed() || self.conn.is_some() {
+            return;
+        }
+        let Some(profile) = self.state.selected_profile().cloned() else { return };
+        let routing = self.state.settings.routing();
+        if let Err(e) = geodata::ensure_available(&routing, self.store.dir()) {
+            tracing::info!("no standby before the first connection: {e:#}");
+            return;
+        }
+        let helper = match helper_binary() {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!("no standby before the first connection: {e:#}");
+                return;
+            }
+        };
+        if !tokio::task::spawn_blocking(move || veil_helper::is_current(&helper)).await.unwrap_or(false) {
+            tracing::info!("no standby before the first connection: the helper is not installed yet");
+            return;
+        }
+        let req = veil_helper::Request::Start {
+            server: Box::new(profile.server),
+            routing,
+            geo_dir: self.store.dir().to_path_buf(),
+            mixed_port: self.state.settings.mixed_port,
+            routes: veil_helper::TunRoutes::All,
+            standby: true,
+        };
+        let r = tokio::task::spawn_blocking(move || helper_ok(veil_helper::call(&req)?))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r);
+        match r {
+            Ok(()) => {
+                self.conn = Some(Conn::Tun);
+                self.standby = true;
+                self.standby_epoch += 1;
+                self.connected_at = None;
+                tracing::info!("standby before the first connection: VPN traffic blocked");
+            }
+            Err(e) => tracing::warn!("no standby before the first connection: {e:#}"),
+        }
+    }
+
+    /// Windows has no standby (the TUN runs inside the app).
+    #[cfg(windows)]
+    pub async fn start_in_standby(&mut self) {}
 
     /// Leaves standby: the current server and rules first (they may have changed while the
     /// VPN was off), then VPN connections are let through again.
@@ -1174,6 +1265,21 @@ pub fn after_pid<I: IntoIterator<Item = String>>(args: I) -> Option<u32> {
 /// Whether the command line (without the program name) asks for `--connect-tun`.
 pub fn wants_connect_tun<I: IntoIterator<Item = String>>(args: I) -> bool {
     args.into_iter().any(|a| a == CONNECT_TUN_ARG)
+}
+
+/// Command-line flag of the autostart entry: start in the menu bar / tray, without a window.
+pub const HIDDEN_ARG: &str = "--hidden";
+
+/// Whether the command line (without the program name) asks for `--hidden`.
+pub fn wants_hidden<I: IntoIterator<Item = String>>(args: I) -> bool {
+    args.into_iter().any(|a| a == HIDDEN_ARG)
+}
+
+/// Whether "Connect when Veil opens" is on.
+impl Core {
+    pub fn auto_connect_enabled(&self) -> bool {
+        self.state.settings.auto_connect
+    }
 }
 
 /// The helper ships next to the app binary (Contents/MacOS in the bundle).

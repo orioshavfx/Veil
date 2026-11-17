@@ -198,6 +198,9 @@ function render() {
   $('kill-switch-row').hidden = !killShown;
   $('kill-switch-desc').hidden = !killShown;
   $('kill-switch').checked = Boolean(s.kill_switch);
+  $('launch-at-login').checked = Boolean(s.launch_at_login);
+  $('launch-at-login-row').hidden = !s.autostart_available;
+  $('auto-connect').checked = Boolean(s.auto_connect);
   if ($('routing').children.length !== s.presets.length) {
     $('routing').replaceChildren(...s.presets.map(([name, label]) => {
       const b = el('button', null, label);
@@ -700,6 +703,16 @@ async function installUpdate() {
     await loadUpdates();
   }
 }
+
+$('auto-connect').onchange = (e) => {
+  const enabled = e.target.checked;
+  call('set_auto_connect', { enabled }).catch(() => { e.target.checked = !enabled; });
+};
+
+$('launch-at-login').onchange = (e) => {
+  const enabled = e.target.checked;
+  call('set_launch_at_login', { enabled }).catch(() => { e.target.checked = !enabled; });
+};
 
 $('check-updates').onchange = (e) => {
   const enabled = e.target.checked;

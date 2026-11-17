@@ -30,6 +30,8 @@ const COMMANDS: &[&str] = &[
     "check_update",
     "install_update",
     "set_check_updates",
+    "set_auto_connect",
+    "set_launch_at_login",
 ];
 
 fn main() {

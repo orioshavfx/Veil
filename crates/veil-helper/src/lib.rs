@@ -24,6 +24,9 @@ pub enum Request {
         mixed_port: u16,
         #[serde(default)]
         routes: TunRoutes,
+        /// Bring the tunnel up already on standby (the kill switch before the first connect).
+        #[serde(default)]
+        standby: bool,
     },
     /// Switch server and/or rules of the running session without restarting TUN.
     Update {

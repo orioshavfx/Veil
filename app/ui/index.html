@@ -59,7 +59,20 @@
         <input type="checkbox" id="kill-switch">
         <span>Block sites that use VPN while it is off</span>
       </label>
-      <p class="desc" id="kill-switch-desc" hidden>TUN mode only. When you disconnect, sites and apps that the rules send through the VPN stay blocked instead of opening directly; direct sites keep working. Quit Veil to restore normal internet.</p>
+      <p class="desc" id="kill-switch-desc" hidden>TUN mode only. Sites and apps that the rules send through the VPN stay blocked instead of opening directly: from the moment Veil starts, before the first connection, and after you disconnect. Direct sites keep working. Quit Veil to restore normal internet.</p>
+    </section>
+
+    <section class="card" id="startup-card">
+      <h3>Startup</h3>
+      <label class="check" id="launch-at-login-row">
+        <input type="checkbox" id="launch-at-login">
+        <span>Launch Veil when I log in</span>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="auto-connect">
+        <span>Connect when Veil opens</span>
+      </label>
+      <p class="desc">At login Veil starts in the menu bar / tray without a window. With “Connect when Veil opens” it connects to the selected server right away (and tries again for a few seconds if the network is not up yet).</p>
     </section>
 
     <section class="card">

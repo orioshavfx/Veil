@@ -4,6 +4,13 @@
 
 ### Added
 
+- Settings → Startup: "Launch Veil when I log in" (macOS LaunchAgent, Windows `Run` key; starts
+  hidden with `--hidden`) and "Connect when Veil opens" (`launch_at_login`, `auto_connect` in
+  `state.json`, both off by default; a failed auto-connect is retried a few times).
+- Kill switch (macOS, TUN): the tunnel now comes up on standby when Veil starts, and when the
+  switch is turned on while disconnected, so VPN traffic is blocked before the first connection
+  too. It needs the installed helper and never asks for the password at start.
+
 - In-app updates on macOS (Settings → Updates): "Check for updates", release notes, "Install and
   restart" with progress. Uses the Rust API of `tauri-plugin-updater` 2.14 (no JS package, no
   `updater:*` permissions for the window). Updates come from the latest GitHub release

@@ -26,6 +26,8 @@
     "allow-update-status",
     "allow-check-update",
     "allow-install-update",
-    "allow-set-check-updates"
+    "allow-set-check-updates",
+    "allow-set-auto-connect",
+    "allow-set-launch-at-login"
   ]
 }

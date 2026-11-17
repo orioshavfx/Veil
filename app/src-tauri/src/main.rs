@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod autostart;
 mod core;
 mod popover;
 mod updater;
@@ -137,6 +138,55 @@ async fn set_kill_switch(app: AppHandle, core: CoreState<'_>, enabled: bool) -> 
     let r = core.lock().await.set_kill_switch(enabled).await.map_err(msg);
     update_tray(&app).await;
     r
+}
+
+/// Settings → Startup: connect as soon as the app opens.
+#[tauri::command]
+async fn set_auto_connect(core: CoreState<'_>, enabled: bool) -> Result<(), String> {
+    core.lock().await.set_auto_connect(enabled).map_err(msg)
+}
+
+/// Settings → Startup: start the app (hidden) at login.
+#[tauri::command]
+async fn set_launch_at_login(core: CoreState<'_>, enabled: bool) -> Result<(), String> {
+    core.lock().await.set_launch_at_login(enabled).map_err(msg)
+}
+
+/// Right after the app starts: connect (setting "Connect when Veil opens"), or, with the kill
+/// switch on, bring the tunnel up on standby. Right after login the network may not be up yet,
+/// so a failed connect is tried again a few times.
+async fn startup_connect(handle: AppHandle) {
+    const TRIES: u32 = 4;
+    let auto = handle.state::<Mutex<Core>>().lock().await.auto_connect_enabled();
+    if !auto {
+        handle.state::<Mutex<Core>>().lock().await.start_in_standby().await;
+    } else {
+        for attempt in 1..=TRIES {
+            let (r, relaunch) = {
+                let core = handle.state::<Mutex<Core>>();
+                let mut c = core.lock().await;
+                if c.is_connected() {
+                    break;
+                }
+                let r = c.connect().await;
+                (r, c.take_relaunch())
+            };
+            quit_for_relaunch(&handle, relaunch);
+            match r {
+                Ok(()) => break,
+                // Nothing to retry: no server yet.
+                Err(e) if format!("{e:#}").contains("add a server first") => break,
+                Err(e) if attempt < TRIES => {
+                    tracing::info!("auto-connect {attempt}/{TRIES} failed: {e:#}; trying again");
+                    update_tray(&handle).await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                Err(e) => tracing::warn!("auto-connect gave up: {e:#}"),
+            }
+        }
+    }
+    update_tray(&handle).await;
+    let _ = tauri::Emitter::emit(&handle, "state-changed", ());
 }
 
 #[tauri::command]
@@ -552,6 +602,7 @@ fn main() {
         return;
     }
     let connect_tun = core::wants_connect_tun(args.iter().cloned());
+    let hidden = core::wants_hidden(args.iter().cloned());
     #[cfg(windows)]
     if let Some(pid) = core::after_pid(args.iter().cloned()) {
         wait_for_exit(pid, Duration::from_secs(10));
@@ -606,6 +657,8 @@ fn main() {
             updater::check_update,
             updater::install_update,
             updater::set_check_updates,
+            set_auto_connect,
+            set_launch_at_login,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -790,6 +843,17 @@ fn main() {
                 });
             }
 
+            // Started at login (`--hidden`): only the menu bar / tray icon, no window.
+            if hidden && let Some(w) = app.get_webview_window("main") {
+                let _ = w.hide();
+            }
+            // The autostart entry follows the app if it was moved; then connect / standby.
+            app.state::<Mutex<Core>>().blocking_lock().refresh_autostart();
+            if !connect_tun {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(startup_connect(handle));
+            }
+
             // macOS: one quiet check for a newer release (if configured and not turned off).
             updater::spawn_startup_check(app.handle());
 
@@ -869,4 +933,31 @@ fn main() {
         RunEvent::Reopen { .. } => show_window(app),
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod acl_tests {
+    /// Every command registered in `generate_handler!` must be listed in `build.rs` and allowed
+    /// for the main window in `capabilities/default.json`; otherwise the app answers the call
+    /// with "Command … not allowed by ACL" (nothing in the compiler or the other tests notices).
+    #[test]
+    fn every_command_is_allowed_for_the_main_window() {
+        let main_rs = include_str!("main.rs");
+        let build_rs = include_str!("../build.rs");
+        let caps = include_str!("../capabilities/default.json");
+        let start = main_rs.find("generate_handler![").expect("handler list") + "generate_handler![".len();
+        let list = &main_rs[start..start + main_rs[start..].find("])").expect("end of handler list")];
+        let names: Vec<&str> = list
+            .lines()
+            .filter(|l| !l.contains("popover::")) // the menu bar panel has its own capability
+            .map(|l| l.trim().trim_end_matches(',').rsplit("::").next().unwrap_or("").trim())
+            .filter(|n| !n.is_empty() && !n.starts_with("//"))
+            .collect();
+        assert!(names.len() > 20, "parsed {names:?}");
+        for n in names {
+            assert!(build_rs.contains(&format!("\"{n}\"")), "{n} is missing in build.rs COMMANDS");
+            let perm = format!("\"allow-{}\"", n.replace('_', "-"));
+            assert!(caps.contains(&perm), "{perm} is missing in capabilities/default.json");
+        }
+    }
 }
