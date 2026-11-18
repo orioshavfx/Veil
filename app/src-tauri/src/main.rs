@@ -206,7 +206,9 @@ const TRAY_ID: &str = "main";
 // SF Symbols "shield" / "shield.fill", rendered by app/tools/render-symbols.swift.
 // macOS tints the black ones (template images); Windows gets white ones on a dark taskbar;
 // Linux always gets white ones (waybar and most tray hosts are dark).
+#[cfg(not(target_os = "linux"))]
 const TRAY_OFF: &[u8] = include_bytes!("../icons/tray-off.png");
+#[cfg(not(target_os = "linux"))]
 const TRAY_ON: &[u8] = include_bytes!("../icons/tray-on.png");
 #[cfg(any(windows, target_os = "linux"))]
 const TRAY_OFF_WHITE: &[u8] = include_bytes!("../icons/tray-off-white.png");
