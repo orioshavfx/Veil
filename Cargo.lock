@@ -5884,7 +5884,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "veil-app"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5908,7 +5908,7 @@ dependencies = [
 
 [[package]]
 name = "veil-cli"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -5924,7 +5924,7 @@ dependencies = [
 
 [[package]]
 name = "veil-config"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5942,7 +5942,7 @@ dependencies = [
 
 [[package]]
 name = "veil-engine"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5968,7 +5968,7 @@ dependencies = [
 
 [[package]]
 name = "veil-helper"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -5985,7 +5985,7 @@ dependencies = [
 
 [[package]]
 name = "veil-proto"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -6025,7 +6025,7 @@ dependencies = [
 
 [[package]]
 name = "veil-sysproxy"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "anyhow",
  "serde",

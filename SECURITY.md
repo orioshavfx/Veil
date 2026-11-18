@@ -10,7 +10,7 @@ Supported: the latest release only (1.0.0-beta.x, macOS on Apple Silicon). The W
 
 ## Known limitations
 
-Veil 1.0.0-beta.1 has had a code review of the root helper but **no independent security audit**.
+Veil 1.0.0-beta.2 has had a code review of the root helper but **no independent security audit**.
 These are the weaknesses we know about. They are not fixed yet.
 
 ### The TUN helper runs as root

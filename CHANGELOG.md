@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- Standby (macOS): after "Connect" from standby the app now drops its standby mark; before, the
+  standby watch took the helper's "no standby" for a lost one and stopped the TUN a second later
+  ("Standby ended: the TUN helper stopped").
+- Windows: every PowerShell call and every step of the TUN start is timed in `veil.log`.
+
+Version 1.0.0-beta.2.
+
 ### Added
 
 - Settings → Startup: "Launch Veil when I log in" (macOS LaunchAgent, Windows `Run` key; starts
