@@ -59,6 +59,12 @@ jobs:
       - run: cargo test --workspace --locked
       - name: Linux scripts
         run: bash -n app/build-linux.sh
+      - name: Release tarball
+        run: bash app/build-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: veil-linux
+          path: dist/
 
   windows:
     runs-on: windows-latest
