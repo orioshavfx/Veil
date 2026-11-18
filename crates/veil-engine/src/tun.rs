@@ -1,4 +1,4 @@
-//! TUN mode: capture all traffic through a utun device.
+//! TUN mode: capture all traffic through a utun device (`veil0` on Linux).
 //!
 //! DNS queries are answered with fake addresses from 198.18.0.0/15, so TCP
 //! connections arrive with the original domain name and the proxy server does
@@ -158,6 +158,18 @@ fn probe_network(tun_name: &str) -> Option<NetState> {
     );
     usable_observation(NetState::new(phys, gateway, filter_system_dns(sys)), tun_name)
 }
+
+/// Name of the TUN device on Linux.
+#[cfg(target_os = "linux")]
+const TUN_LINUX_NAME: &str = "veil0";
+
+#[cfg(windows)]
+const TUN_CREATE_HINT: &str = "cannot create TUN device (on Windows: run as administrator, wintun.dll next to the exe)";
+#[cfg(target_os = "linux")]
+const TUN_CREATE_HINT: &str = "cannot create TUN device veil0 (needs /dev/net/tun, the `tun` kernel module and CAP_NET_ADMIN; \
+     if veil0 already exists, another instance or a stale device is holding it: `ip link del veil0`)";
+#[cfg(not(any(windows, target_os = "linux")))]
+const TUN_CREATE_HINT: &str = "cannot create TUN device (run as root)";
 
 /// Routing state that follows the physical network; shared with the watcher task.
 struct NetCfg {
@@ -326,6 +338,9 @@ impl Tun {
     pub(crate) async fn start(shared: Arc<Shared>, opts: TunOptions, server: &ServerConfig) -> Result<Self> {
         #[cfg(unix)]
         if unsafe { libc::geteuid() } != 0 {
+            #[cfg(target_os = "linux")]
+            anyhow::bail!("TUN mode needs root (or CAP_NET_ADMIN): run with sudo or through the veil-helper service");
+            #[cfg(not(target_os = "linux"))]
             anyhow::bail!("TUN mode needs root: run with sudo");
         }
         // One TUN setup or cleanup at a time across processes (Windows): the guard of a
@@ -431,12 +446,16 @@ impl Tun {
         // A fixed alias: cleanup and veil-rescue.ps1 recognise our adapter by it (and its address).
         #[cfg(windows)]
         let builder = builder.name(veil_sysproxy::TUN_ADAPTER_NAME);
+        // A fixed name: the helper's routes and DNS settings refer to it, and a leftover device is
+        // easy to spot.
+        #[cfg(target_os = "linux")]
+        let builder = builder.name(TUN_LINUX_NAME);
         let dev = builder
             .ipv4(TUN_ADDR, TUN_PREFIX, None)
             .ipv6(TUN_ADDR6, 64)
             .mtu(opts.mtu)
             .build_async()
-            .context("cannot create TUN device (on Windows: run as administrator, wintun.dll next to the exe)")?;
+            .context(TUN_CREATE_HINT)?;
         let name = dev.name()?;
         tracing::info!("TUN adapter {name} created");
         #[cfg(not(windows))]

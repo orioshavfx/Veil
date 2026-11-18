@@ -2,6 +2,8 @@
 
 mod autostart;
 mod core;
+#[cfg(target_os = "linux")]
+mod linux;
 mod popover;
 mod updater;
 
@@ -202,12 +204,13 @@ async fn ping_all(core: CoreState<'_>) -> Result<(), String> {
 
 const TRAY_ID: &str = "main";
 // SF Symbols "shield" / "shield.fill", rendered by app/tools/render-symbols.swift.
-// macOS tints the black ones (template images); Windows gets white ones on a dark taskbar.
+// macOS tints the black ones (template images); Windows gets white ones on a dark taskbar;
+// Linux always gets white ones (waybar and most tray hosts are dark).
 const TRAY_OFF: &[u8] = include_bytes!("../icons/tray-off.png");
 const TRAY_ON: &[u8] = include_bytes!("../icons/tray-on.png");
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const TRAY_OFF_WHITE: &[u8] = include_bytes!("../icons/tray-off-white.png");
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const TRAY_ON_WHITE: &[u8] = include_bytes!("../icons/tray-on-white.png");
 
 /// Whether the Windows taskbar is dark (the default), so the tray needs white icons.
@@ -241,7 +244,9 @@ fn tray_icon(connected: bool) -> tauri::image::Image<'static> {
         (true, false) => TRAY_ON,
         (false, false) => TRAY_OFF,
     };
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    let bytes = if connected { TRAY_ON_WHITE } else { TRAY_OFF_WHITE };
+    #[cfg(not(any(windows, target_os = "linux")))]
     let bytes = if connected { TRAY_ON } else { TRAY_OFF };
     tauri::image::Image::from_bytes(bytes).expect("bundled tray icon")
 }
@@ -371,15 +376,22 @@ fn tray_menu(app: &AppHandle, info: &TrayInfo) -> tauri::Result<Menu<tauri::Wry>
 fn show_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
+        let _ = w.unminimize();
         let _ = w.set_focus();
     }
 }
 
-/// Where the log goes: ~/Library/Logs/Veil on macOS, %LOCALAPPDATA%\Veil on Windows.
+/// Where the log goes: ~/Library/Logs/Veil on macOS, %LOCALAPPDATA%\Veil on Windows,
+/// $XDG_STATE_HOME/veil (~/.local/state/veil) on Linux.
 fn log_dir() -> Option<std::path::PathBuf> {
     #[cfg(windows)]
     return std::env::var_os("LOCALAPPDATA").map(|d| std::path::Path::new(&d).join("Veil"));
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    return match std::env::var_os("XDG_STATE_HOME").map(std::path::PathBuf::from).filter(|d| d.is_absolute()) {
+        Some(d) => Some(d.join("veil")),
+        None => std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".local/state/veil")),
+    };
+    #[cfg(not(any(windows, target_os = "linux")))]
     return std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join("Library/Logs/Veil"));
 }
 
@@ -603,6 +615,12 @@ fn main() {
     }
     let connect_tun = core::wants_connect_tun(args.iter().cloned());
     let hidden = core::wants_hidden(args.iter().cloned());
+    // Linux: a second launch shows the window of the running copy and exits.
+    #[cfg(target_os = "linux")]
+    let single_listener = match linux::single_instance() {
+        linux::Instance::Secondary => return,
+        linux::Instance::Primary(l) => l,
+    };
     #[cfg(windows)]
     if let Some(pid) = core::after_pid(args.iter().cloned()) {
         wait_for_exit(pid, Duration::from_secs(10));
@@ -744,6 +762,16 @@ fn main() {
                 })
                 .build(app)?;
 
+            // Linux: a second launch asks this copy to show its window.
+            #[cfg(target_os = "linux")]
+            if let Some(listener) = single_listener {
+                let handle = app.handle().clone();
+                linux::serve(listener, move || {
+                    let h = handle.clone();
+                    let _ = handle.run_on_main_thread(move || show_window(&h));
+                });
+            }
+
             // The menu bar panel, created hidden now so that the first click opens it at once.
             #[cfg(target_os = "macos")]
             let _ = popover::mac::window(app.handle());
@@ -846,6 +874,23 @@ fn main() {
             // Started at login (`--hidden`): only the menu bar / tray icon, no window.
             if hidden && let Some(w) = app.get_webview_window("main") {
                 let _ = w.hide();
+                // Linux: the tray host (waybar) may start after us; if none shows up, the
+                // window is the only way to reach the app, so bring it back.
+                #[cfg(target_os = "linux")]
+                {
+                    let handle = app.handle().clone();
+                    std::thread::spawn(move || {
+                        for _ in 0..30 {
+                            if linux::tray_available() {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_secs(1));
+                        }
+                        tracing::warn!("no system tray found: showing the window");
+                        let h = handle.clone();
+                        let _ = handle.run_on_main_thread(move || show_window(&h));
+                    });
+                }
             }
             // The autostart entry follows the app if it was moved; then connect / standby.
             app.state::<Mutex<Core>>().blocking_lock().refresh_autostart();
@@ -878,6 +923,12 @@ fn main() {
             // Closing the window keeps the app running in the menu bar / tray.
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
+                // Linux without a tray host: a hidden window could not be brought back.
+                #[cfg(target_os = "linux")]
+                if !linux::tray_available() {
+                    let _ = window.minimize();
+                    return;
+                }
                 let _ = window.hide();
             }
             // The menu bar panel closes when it loses focus, like a menu.

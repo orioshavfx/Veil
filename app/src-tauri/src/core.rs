@@ -86,7 +86,7 @@ pub struct UiState {
     autostart_available: bool,
     error: Option<String>,
     port: u16,
-    /// `macos` or `windows`, for platform-specific texts in the UI.
+    /// `macos`, `windows` or `linux`, for platform-specific texts in the UI.
     platform: &'static str,
     /// TUN mode: macOS (privileged helper) and Windows (elevated app + wintun.dll).
     tun_available: bool,
@@ -1654,5 +1654,21 @@ mod tests {
         let reopened = Core::open_store(Store::open(&dir).unwrap()).unwrap();
         assert_eq!(reopened.snapshot().profiles.len(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    #[test]
+    fn packaged_helper_is_preferred_then_the_one_next_to_the_app() {
+        let c = super::helper_candidates(std::path::Path::new("/opt/veil"));
+        assert_eq!(c[0], std::path::PathBuf::from("/usr/lib/veil/veil-helper"));
+        assert_eq!(c[1], std::path::PathBuf::from("/opt/veil/veil-helper"));
+    }
+
+    #[test]
+    fn linux_has_tun_but_no_kill_switch() {
+        assert!(super::TUN_AVAILABLE);
+        assert!(!super::STANDBY_AVAILABLE);
     }
 }

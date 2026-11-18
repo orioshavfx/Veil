@@ -40,6 +40,10 @@ const MODE_DESC = {
     proxy: 'Uses the macOS system proxy. No password needed.',
     tun: 'Routes all system traffic, including apps that ignore the proxy. Asks for an administrator password the first time.',
   },
+  linux: {
+    proxy: 'Runs a local proxy (SOCKS/HTTP on 127.0.0.1) for apps that use it. No password needed.',
+    tun: 'Routes all traffic through the veil0 network device, including apps that ignore the proxy. Asks for your password (polkit) the first time to install the helper service.',
+  },
   windows: {
     proxy: 'Uses the Windows system proxy. No administrator rights needed.',
     tun: 'Routes all traffic, including apps that ignore the proxy. Veil restarts with administrator permission (Windows asks you to confirm).',
@@ -600,7 +604,9 @@ function renderUpdates() {
   $('updates-desc').hidden = !ready;
   $('update-pill').hidden = !(ready && u.available);
   let text = '';
-  if (u.availability === 'unsupported') text = `Veil does not update itself on this system. Download new versions from ${u.releases_page}`;
+  if (u.availability === 'unsupported') text = state?.platform === 'linux'
+    ? 'Veil does not update itself on Linux. Update it with your package manager, or download new versions from ' + u.releases_page
+    : `Veil does not update itself on this system. Download new versions from ${u.releases_page}`;
   else if (u.availability === 'not_configured') text = 'Updates are not configured in this build.';
   else if (u.error) text = u.error;
   else if (u.available) text = `Version ${u.available.version} is available${u.available.date ? ` (${u.available.date})` : ''}.`;

@@ -5,6 +5,11 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{all_apps, find, process_info, running_apps};
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::{all_apps, find, process_info, running_apps};
+
 #[cfg(any(windows, test))]
 #[cfg_attr(not(windows), allow(dead_code))]
 mod socket_table;
@@ -225,7 +230,7 @@ impl ProcessInfo {
     }
 }
 
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg_attr(any(windows, target_os = "linux"), allow(dead_code))]
 pub(crate) fn info_from_path(pid: i32, path: String) -> ProcessInfo {
     let exe = path.rsplit('/').next().unwrap_or("").to_string();
     let app = path
