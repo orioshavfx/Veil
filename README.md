@@ -58,6 +58,13 @@ By hand:
 
 Intel Macs: no prebuilt binary; build from source.
 
+## Linux (beta)
+
+Arch / CachyOS with Hyprland or niri (TUN mode, root helper under systemd, tray via
+StatusNotifier). There is no prebuilt package yet: build it with `makepkg -si` in
+`packaging/linux` or with `app/build-linux.sh`. Setup, autostart and recovery steps are in
+[packaging/linux/README.md](packaging/linux/README.md).
+
 ## First launch
 
 Veil is not signed with an Apple Developer ID and not notarized (it is ad-hoc signed only), so

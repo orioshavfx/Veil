@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Veil
+GenericName=VPN client
+Comment=VPN / proxy client (VLESS, VMess, Trojan, Shadowsocks, Hysteria2)
+Exec=veil %U
+Icon=dev.veil.app
+Terminal=false
+Categories=Network;Utility;
+Keywords=vpn;proxy;vless;tun;
+StartupWMClass=dev.veil.app

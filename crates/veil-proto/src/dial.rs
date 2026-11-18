@@ -1,7 +1,7 @@
 //! Outgoing sockets and name resolution.
 //!
 //! In TUN mode the default route points into the tunnel, so every socket we open
-//! ourselves is pinned to the physical interface (`IP_BOUND_IF`) and names are
+//! ourselves is pinned to the physical interface (`IP_BOUND_IF`, `SO_BINDTODEVICE`, `IP_UNICAST_IF`) and names are
 //! resolved by querying the original DNS servers over that interface.
 
 use std::collections::HashMap;
@@ -79,7 +79,34 @@ fn pin_socket(s: &Socket, v4: bool, if_index: NonZeroU32) -> io::Result<()> {
     if rc != 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+/// Linux: `SO_BINDTODEVICE` by interface name (we run as root in TUN mode, and the option
+/// is also allowed unprivileged since 5.7). If it is refused, falls back to
+/// `IP_UNICAST_IF`/`IPV6_UNICAST_IF`, which take the index (network byte order for IPv4,
+/// host order for IPv6). Must be set before connect/send.
+#[cfg(target_os = "linux")]
+fn pin_socket(s: &Socket, v4: bool, if_index: NonZeroU32) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut name = [0u8; libc::IF_NAMESIZE];
+    let ok = unsafe { libc::if_indextoname(if_index.get(), name.as_mut_ptr().cast()) };
+    if !ok.is_null() {
+        let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+        match s.bind_device(Some(&name[..len])) {
+            Ok(()) => return Ok(()),
+            Err(e) => tracing::debug!("SO_BINDTODEVICE failed ({e}), trying UNICAST_IF"),
+        }
+    }
+    let (level, opt, value) = if v4 {
+        (libc::IPPROTO_IP, libc::IP_UNICAST_IF, if_index.get().to_be())
+    } else {
+        (libc::IPPROTO_IPV6, libc::IPV6_UNICAST_IF, if_index.get())
+    };
+    let rc = unsafe {
+        libc::setsockopt(s.as_raw_fd(), level, opt, (&raw const value).cast(), size_of::<u32>() as libc::socklen_t)
+    };
+    if rc != 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn pin_socket(_s: &Socket, _v4: bool, _if_index: NonZeroU32) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "interface pinning is not supported on this OS"))
 }

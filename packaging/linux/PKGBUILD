@@ -1,0 +1,60 @@
+# Maintainer: Veil contributors
+# Builds Veil from the git checkout this file lives in (packaging/linux/PKGBUILD):
+#   cd packaging/linux && makepkg -si
+pkgname=veil-vpn
+pkgver=1.0.0_beta.2
+pkgrel=1
+pkgdesc='VPN / proxy client (VLESS, VMess, Trojan, Shadowsocks, Hysteria2) with a TUN mode'
+arch=('x86_64' 'aarch64')
+url='https://github.com/orioshavfx/Veil'
+license=('MIT')
+depends=('webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator' 'polkit' 'iproute2' 'systemd')
+makedepends=('rust' 'cargo' 'pkgconf' 'openssl' 'librsvg')
+optdepends=('systemd-resolvconf: DNS handling without systemd-resolved'
+            'networkmanager: typical network manager (Veil works with any)'
+            'hyprpolkitagent: polkit agent for installing the helper under Hyprland'
+            'polkit-gnome: polkit agent for installing the helper')
+provides=('veil')
+conflicts=('veil')
+options=('!lto')
+# The repository root is two levels up from this file; no download needed.
+source=()
+sha256sums=()
+
+_root() { cd "$startdir/../.." && pwd; }
+
+prepare() {
+  cd "$(_root)"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+  cd "$(_root)"
+  local triple
+  triple=$(rustc -vV | sed -n 's/^host: //p')
+  export CARGO_TARGET_DIR="$srcdir/target"
+  # The app crate embeds the helper as a Tauri sidecar and checks for it at build time.
+  cargo build --release --frozen -p veil-helper
+  mkdir -p app/src-tauri/binaries
+  cp "$CARGO_TARGET_DIR/release/veil-helper" "app/src-tauri/binaries/veil-helper-$triple"
+  # custom-protocol = embed the UI instead of loading a dev server (what `cargo tauri build` enables).
+  cargo build --release --frozen -p veil-app --features tauri/custom-protocol
+}
+
+package() {
+  local root
+  root=$(_root)
+  local target="$srcdir/target/release"
+  install -Dm755 "$target/veil-app" "$pkgdir/usr/bin/veil"
+  install -Dm755 "$target/veil-helper" "$pkgdir/usr/lib/veil/veil-helper"
+  install -Dm644 "$root/packaging/linux/veil-helper@.service" \
+    "$pkgdir/usr/lib/systemd/system/veil-helper@.service"
+  install -Dm644 "$root/packaging/linux/dev.veil.app.desktop" \
+    "$pkgdir/usr/share/applications/dev.veil.app.desktop"
+  local icons="$root/app/src-tauri/icons"
+  install -Dm644 "$icons/32x32.png" "$pkgdir/usr/share/icons/hicolor/32x32/apps/dev.veil.app.png"
+  install -Dm644 "$icons/128x128.png" "$pkgdir/usr/share/icons/hicolor/128x128/apps/dev.veil.app.png"
+  install -Dm644 "$icons/128x128@2x.png" "$pkgdir/usr/share/icons/hicolor/256x256/apps/dev.veil.app.png"
+  install -Dm644 "$icons/icon.png" "$pkgdir/usr/share/icons/hicolor/512x512/apps/dev.veil.app.png"
+  install -Dm644 "$root/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

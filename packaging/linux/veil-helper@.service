@@ -1,0 +1,17 @@
+[Unit]
+Description=Veil TUN helper for uid %i
+Documentation=https://github.com/orioshavfx/Veil
+After=network.target
+
+[Service]
+Type=simple
+# Root daemon: creates the veil0 TUN device, routes and DNS. Only uid %i (and root) may talk to it.
+ExecStart=/usr/lib/veil/veil-helper --uid %i
+Restart=on-failure
+RestartSec=2
+# /run/veil/helper.sock and the DNS backup directory.
+RuntimeDirectory=veil
+StateDirectory=veil
+
+[Install]
+WantedBy=multi-user.target
