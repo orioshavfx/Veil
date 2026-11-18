@@ -19,7 +19,7 @@ pub enum TunRoutes {
 }
 
 impl TunRoutes {
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     fn v4(self) -> &'static [&'static str] {
         match self {
             TunRoutes::All => &["0.0.0.0/1", "128.0.0.0/1"],
@@ -50,8 +50,8 @@ impl CleanupReport {
     }
 }
 
-/// Nothing outlives the process here: the routes and DNS settings are tied to the utun
-/// device and restored by `dns_restore`.
+/// Nothing outlives the process here: the routes and DNS settings are tied to the TUN
+/// device and restored by `dns_restore` (macOS, Linux).
 #[cfg(not(windows))]
 pub fn tun_cleanup() -> CleanupReport {
     CleanupReport::default()
@@ -79,6 +79,11 @@ pub fn tun_leftovers_suspected() -> bool {
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::*;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::*;
 
 #[cfg(any(windows, test))]
 mod winnet;

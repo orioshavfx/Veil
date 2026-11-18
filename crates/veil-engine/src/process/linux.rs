@@ -11,8 +11,6 @@ use std::time::{Duration, Instant};
 
 use super::{AppEntry, ProcessInfo, Proto};
 
-/// A cached table is rebuilt on a miss only when it is at least this old.
-const MISS_REFRESH_AFTER: Duration = Duration::from_millis(50);
 /// A cached table is used for hits up to this age.
 const TABLE_TTL: Duration = Duration::from_millis(500);
 const OWNERS_TTL: Duration = Duration::from_secs(3);
@@ -51,7 +49,8 @@ fn parse_table(text: &str) -> Vec<Entry> {
                 _ => return None,
             };
             let inode: u64 = inode.parse().ok()?;
-            (inode != 0).then(|| Entry { addr, port: u16::from_str_radix(p, 16).ok()?, inode })
+            let port = u16::from_str_radix(p, 16).ok()?;
+            (inode != 0).then_some(Entry { addr, port, inode })
         })
         .collect()
 }
@@ -103,6 +102,7 @@ fn read_tables(proto: Proto) -> Vec<Entry> {
 
 fn lookup_inode(proto: Proto, local: SocketAddr) -> Option<u64> {
     let key = proto as u8;
+    let started = Instant::now();
     let mut guard = TABLES.lock().unwrap();
     let tables = guard.get_or_insert_default();
     if let Some(c) = tables.get(&key)
@@ -111,8 +111,9 @@ fn lookup_inode(proto: Proto, local: SocketAddr) -> Option<u64> {
     {
         return Some(i);
     }
-    // Miss (or stale): the socket may be newer than the snapshot.
-    if tables.get(&key).is_some_and(|c| c.at.elapsed() < MISS_REFRESH_AFTER) {
+    // Miss: the socket may be newer than the snapshot. A snapshot taken while we waited for
+    // the lock (by a concurrent lookup) postdates our socket, so its miss is final.
+    if tables.get(&key).is_some_and(|c| c.at >= started) {
         return None;
     }
     let fresh = Cached::new(read_tables(proto));
@@ -141,6 +142,7 @@ fn scan_owners() -> HashMap<u64, i32> {
 }
 
 fn owner_of(inode: u64) -> Option<i32> {
+    let started = Instant::now();
     let mut guard = OWNERS.lock().unwrap();
     if let Some(c) = guard.as_ref()
         && c.at.elapsed() < OWNERS_TTL
@@ -148,7 +150,7 @@ fn owner_of(inode: u64) -> Option<i32> {
     {
         return Some(pid);
     }
-    if guard.as_ref().is_some_and(|c| c.at.elapsed() < MISS_REFRESH_AFTER) {
+    if guard.as_ref().is_some_and(|c| c.at >= started) {
         return None;
     }
     let fresh = Cached::new(scan_owners());

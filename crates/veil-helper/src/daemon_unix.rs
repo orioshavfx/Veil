@@ -37,8 +37,8 @@ async fn stop(state: &mut State) {
 }
 
 fn process_alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    // errno is read right after kill(2), before anything else can overwrite it.
+    unsafe { libc::kill(pid as i32, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
 }
 
 /// Root-only DNS backup written by the helper itself; never taken from the client.
