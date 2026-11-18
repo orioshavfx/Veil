@@ -642,6 +642,10 @@ impl Core {
             Step::Nothing => return Ok(()),
             Step::Resume => match self.resume(&profile.server, &routing).await {
                 Ok(()) => {
+                    // The helper let VPN traffic through again: the app must not go on
+                    // treating the session as standby (the standby watch would then call the
+                    // helper's "no standby" a lost one and stop the TUN a second later).
+                    self.standby = false;
                     self.connected_at = Some(Instant::now());
                     return Ok(());
                 }

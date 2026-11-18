@@ -332,15 +332,20 @@ impl Tun {
         // dead run must not clean up under a new start, nor read a half-written journal.
         #[cfg(windows)]
         let _setup_lock = blocking(veil_sysproxy::tun_setup_lock).await?;
+        let t0 = std::time::Instant::now();
+        let step = |what: &str| tracing::info!("TUN start: {what} (+{:.1}s)", t0.elapsed().as_secs_f32());
+        step("setup lock taken");
         // A panic before this TUN existed says nothing about it.
         crate::engine::TUN_PANICKED.store(false, Ordering::SeqCst);
         // Undo leftovers of a run that crashed before touching anything else.
         let backup = opts.dns_backup.clone();
         blocking(move || veil_sysproxy::dns_restore(&backup)).await??;
+        step("leftover DNS checked");
 
         let (phys, bypass, sys_dns) = blocking(physical_net).await??;
         let upstream = bypass.dns.clone();
         let gateway = blocking(|| veil_sysproxy::default_gateway().ok()).await?;
+        step("gateway found");
         tracing::info!("physical interface {phys}, gateway {gateway:?}, direct DNS {upstream:?}");
         let state = NetState::new(phys, gateway, sys_dns);
         dial::set_bypass(Some(bypass));
@@ -350,6 +355,7 @@ impl Tun {
             let _ = blocking(move || veil_sysproxy::cleanup_orphan_host_routes(gw)).await;
         }
 
+        step("starting the adapter");
         let result = match Self::bring_up(shared, &opts, state).await {
             // Quitting meanwhile: take down what was set up (routes, DNS) instead of going on.
             Ok(tun) if crate::engine::shutting_down() => {
@@ -358,6 +364,7 @@ impl Tun {
             }
             r => r,
         };
+        step(if result.is_ok() { "adapter and routes up" } else { "failed" });
         if let Ok(tun) = &result {
             // From here on the system depends on this process: have someone watch it.
             #[cfg(windows)]
@@ -431,6 +438,7 @@ impl Tun {
             .build_async()
             .context("cannot create TUN device (on Windows: run as administrator, wintun.dll next to the exe)")?;
         let name = dev.name()?;
+        tracing::info!("TUN adapter {name} created");
         #[cfg(not(windows))]
         let scoped_default = Self::setup_system(&name, &phys, gateway, opts).await?;
 
@@ -511,6 +519,7 @@ impl Tun {
         {
             let n = name.clone();
             let ready = blocking(move || veil_sysproxy::wait_tun_address(&n)).await.and_then(|r| r);
+            tracing::info!("TUN adapter address ready: {}", ready.is_ok());
             if let Err(e) = &ready {
                 tracing::warn!("TUN adapter not ready: {e:#}; probing the resolver anyway");
             }
@@ -518,7 +527,9 @@ impl Tun {
                 task.abort();
                 return Err(cancelled());
             }
-            if !probe_dns().await {
+            let probed = probe_dns().await;
+            tracing::info!("TUN resolver probe: {probed}");
+            if !probed {
                 task.abort();
                 let _ = (&mut task).await;
                 let state = ready.err().map_or(String::new(), |e| format!(" ({e:#})"));

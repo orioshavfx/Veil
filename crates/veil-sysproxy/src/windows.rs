@@ -102,7 +102,13 @@ fn ps_raw(script: &str, env: &[(&str, &str)], timeout: Duration) -> Result<(bool
     for (k, v) in env {
         cmd.env(k, v);
     }
-    run_cmd(cmd, timeout).context("PowerShell")
+    let started = std::time::Instant::now();
+    let r = run_cmd(cmd, timeout).context("PowerShell");
+    // Every call is timed: on some machines each one takes seconds, and the sum is what
+    // makes a TUN start slow (and the system laggy while it runs).
+    let what: String = script.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(70).collect();
+    tracing::info!("PowerShell {:.1}s ({}): {what}", started.elapsed().as_secs_f32(), if r.is_ok() { "ok" } else { "failed" });
+    r
 }
 
 /// Hosts that never go through the proxy. WinINet takes `*` masks, not CIDR.
