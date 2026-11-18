@@ -34,6 +34,38 @@ jobs:
           bash -n app/build.sh && bash -n app/tools/gen-update-key.sh
           cargo test --locked --manifest-path app/tools/update-sig-check/Cargo.toml
 
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: System packages (Tauri / GTK / WebKitGTK)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libssl-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+      - name: Helper binary (the app crate expects it as a sidecar at build time)
+        run: |
+          TRIPLE=$(rustc -vV | awk '/^host:/{print $2}')
+          cargo build -p veil-helper --locked
+          mkdir -p app/src-tauri/binaries
+          cp target/debug/veil-helper "app/src-tauri/binaries/veil-helper-$TRIPLE"
+      - run: cargo check --workspace --locked
+      - run: cargo clippy --workspace --locked -- -D warnings
+      - name: Tests (crates without a GUI first)
+        run: cargo test --locked -p veil-proto -p veil-config -p veil-engine -p veil-sysproxy -p veil-helper -p veil-cli
+      - run: cargo test --workspace --locked
+      - name: Linux scripts
+        run: bash -n app/build-linux.sh
+      - name: Release tarball
+        run: bash app/build-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: veil-linux
+          path: dist/
+
   windows:
     runs-on: windows-latest
     continue-on-error: true # Windows is experimental

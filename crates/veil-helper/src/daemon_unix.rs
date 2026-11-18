@@ -37,11 +37,15 @@ async fn stop(state: &mut State) {
 }
 
 fn process_alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 || *libc::__error() == libc::EPERM }
+    // errno is read right after kill(2), before anything else can overwrite it.
+    unsafe { libc::kill(pid as i32, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
 }
 
 /// Root-only DNS backup written by the helper itself; never taken from the client.
+#[cfg(target_os = "macos")]
 const DNS_BACKUP_DIR: &str = "/Library/Application Support/dev.veil.helper";
+#[cfg(target_os = "linux")]
+const DNS_BACKUP_DIR: &str = "/var/lib/veil";
 const DNS_BACKUP_FILE: &str = "dns-backup.json";
 
 fn home_dir_of(uid: u32) -> Option<PathBuf> {
@@ -435,12 +439,21 @@ async fn serve(mut conn: UnixStream, allowed_uid: u32, shared: Shared) -> Result
     Ok(())
 }
 
+async fn interrupted(sig: &mut Option<tokio::signal::unix::Signal>) {
+    match sig {
+        Some(s) => {
+            s.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
 #[tokio::main]
 pub async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .with_ansi(false)
-        // launchd keeps stderr in /var/log/dev.veil.helper.log.
+        // launchd keeps stderr in /var/log/dev.veil.helper.log, journald under systemd.
         .with_writer(std::io::stderr)
         .init();
     let args: Vec<String> = std::env::args().collect();
@@ -460,6 +473,18 @@ pub async fn main() -> Result<()> {
         Err(e) => tracing::warn!("cannot restore leftover DNS settings: {e:#}"),
     }
 
+    // Everything below (TUN, routes, DNS) needs root; fail with a clear message under a wrong unit.
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            bail!("veil-helper must run as root (it is started by systemd as veil-helper.service)");
+        }
+        // /run/veil is 0755 root: the user only needs to traverse it to reach the 0666 socket.
+        let dir = Path::new(SOCKET_PATH).parent().context("socket path has no parent")?;
+        std::fs::create_dir_all(dir).context("cannot create the socket directory")?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
+    }
+
     let _ = std::fs::remove_file(SOCKET_PATH);
     let listener = UnixListener::bind(SOCKET_PATH).context("cannot bind helper socket")?;
     // Access control is done with peer credentials, so anyone may connect.
@@ -472,6 +497,12 @@ pub async fn main() -> Result<()> {
         .unwrap_or_default();
     let shared: Shared = Arc::new(Mutex::new(State { binary_hash, ..Default::default() }));
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    // SIGINT (manual run) is handled on Linux only; macOS behaviour is unchanged.
+    let mut int = if cfg!(target_os = "linux") {
+        Some(tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?)
+    } else {
+        None
+    };
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -485,6 +516,12 @@ pub async fn main() -> Result<()> {
             }
             _ = term.recv() => {
                 tracing::info!("terminating");
+                stop(&mut *shared.lock().await).await;
+                let _ = std::fs::remove_file(SOCKET_PATH);
+                return Ok(());
+            }
+            _ = interrupted(&mut int) => {
+                tracing::info!("interrupted");
                 stop(&mut *shared.lock().await).await;
                 let _ = std::fs::remove_file(SOCKET_PATH);
                 return Ok(());

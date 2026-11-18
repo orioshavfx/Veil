@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- Linux (beta): Arch / CachyOS with Hyprland or niri, TUN mode through the `veil0` device and a
+  root helper under systemd (`veil-helper@<uid>.service`, installed via polkit). Packaging in
+  `packaging/linux` (PKGBUILD, desktop file, unit, README), `app/build-linux.sh` for an unsigned
+  tarball with `SHA256SUMS`, and a Linux job in CI.
+
 ### Fixed
 
 - Standby (macOS): after "Connect" from standby the app now drops its standby mark; before, the

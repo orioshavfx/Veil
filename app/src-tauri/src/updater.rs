@@ -320,7 +320,7 @@ pub async fn set_check_updates(core: State<'_, Mutex<Core>>, enabled: bool) -> R
 }
 
 /// Once per start, quietly: the UI shows a small "Update available" in the header, nothing pops up.
-#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables, clippy::needless_return))]
 pub fn spawn_startup_check(app: &AppHandle) {
     if this_build() != Availability::Ready {
         return;

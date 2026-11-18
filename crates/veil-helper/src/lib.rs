@@ -1,6 +1,6 @@
 //! Privileged helper for TUN mode: protocol, client and installer.
 //!
-//! The helper runs as root under launchd and accepts JSON-line requests on a
+//! The helper runs as root under launchd (macOS) or systemd (Linux) and accepts JSON-line requests on a
 //! Unix socket, only from the user it was installed for.
 
 use std::path::{Path, PathBuf};
@@ -75,7 +75,7 @@ pub fn error_text(message: &str) -> String {
     if message.starts_with(BAD_REQUEST) {
         format!(
             "The installed TUN helper belongs to a different version of Veil and did not understand the request. \
-             Disconnect and connect again to reinstall it (macOS asks for an administrator password). ({message})"
+             Disconnect and connect again to reinstall it (it asks for administrator rights). ({message})"
         )
     } else {
         message.to_string()
@@ -105,6 +105,11 @@ pub fn is_current(shipped: &Path) -> bool {
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{INSTALL_PATH, PLIST_PATH, SOCKET_PATH, call, install, uninstall};
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::{INSTALL_PATH, PACKAGE_BINARY, SERVICE_NAME, SOCKET_PATH, UNIT_PATH, call, install, uninstall};
 
 #[cfg(windows)]
 mod windows;

@@ -13,7 +13,7 @@ use veil_config::{PRESETS, RoutingRule, Subscription, SubscriptionUsage, geodata
 use veil_engine::rules::Rules;
 use veil_engine::{Engine, EngineConfig};
 
-/// `Tun` (through the privileged helper) exists on macOS only; Windows runs TUN inside the app.
+/// `Tun` (through the privileged helper) exists on macOS and Linux; Windows runs TUN inside the app.
 #[cfg_attr(windows, allow(dead_code))]
 enum Conn {
     Proxy { engine: Box<Engine>, sysproxy: bool },
@@ -86,7 +86,7 @@ pub struct UiState {
     autostart_available: bool,
     error: Option<String>,
     port: u16,
-    /// `macos` or `windows`, for platform-specific texts in the UI.
+    /// `macos`, `windows` or `linux`, for platform-specific texts in the UI.
     platform: &'static str,
     /// TUN mode: macOS (privileged helper) and Windows (elevated app + wintun.dll).
     tun_available: bool,
@@ -1034,9 +1034,9 @@ impl Drop for ConnectingFlag {
     }
 }
 
-pub const TUN_AVAILABLE: bool = cfg!(any(target_os = "macos", windows));
+pub const TUN_AVAILABLE: bool = cfg!(any(target_os = "macos", windows, target_os = "linux"));
 
-/// Standby (kill switch) needs the TUN in the privileged helper: macOS only.
+/// Standby (kill switch) needs the TUN in the privileged helper: macOS only (not in the Linux beta).
 pub const STANDBY_AVAILABLE: bool = cfg!(target_os = "macos");
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -1286,22 +1286,33 @@ impl Core {
     }
 }
 
-/// The helper ships next to the app binary (Contents/MacOS in the bundle).
+/// Where the packaged helper lives on Linux (installed by the distribution package).
+#[cfg(target_os = "linux")]
+const LINUX_PACKAGED_HELPER: &str = "/usr/lib/veil/veil-helper";
+
+/// Candidate locations of the shipped helper, best first. macOS: next to the app binary
+/// (Contents/MacOS in the bundle). Linux: the package's /usr/lib/veil, then next to the app
+/// (portable / AppImage-like layouts).
+#[cfg(not(windows))]
+fn helper_candidates(exe_dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    #[cfg(target_os = "linux")]
+    v.push(PathBuf::from(LINUX_PACKAGED_HELPER));
+    v.push(exe_dir.join(format!("veil-helper{}", std::env::consts::EXE_SUFFIX)));
+    // Dev-only fallback: never run a binary found via a relative path as root in release builds.
+    #[cfg(debug_assertions)]
+    v.push(exe_dir.join("../../target/release/veil-helper"));
+    v
+}
+
 #[cfg(not(windows))]
 fn helper_binary() -> Result<PathBuf> {
     let exe = std::env::current_exe()?;
     let dir = exe.parent().context("no exe dir")?;
-    for candidate in [
-        dir.join(format!("veil-helper{}", std::env::consts::EXE_SUFFIX)),
-        // Dev-only fallback: never run a binary found via a relative path as root in release builds.
-        #[cfg(debug_assertions)]
-        dir.join("../../target/release/veil-helper"),
-    ] {
-        if candidate.exists() {
-            return Ok(candidate);
-        }
+    match helper_candidates(dir).into_iter().find(|c| c.exists()) {
+        Some(c) => Ok(c),
+        None => bail!("veil-helper not found next to {}", exe.display()),
     }
-    bail!("veil-helper not found next to {}", exe.display())
 }
 
 #[cfg(test)]
@@ -1643,5 +1654,21 @@ mod tests {
         let reopened = Core::open_store(Store::open(&dir).unwrap()).unwrap();
         assert_eq!(reopened.snapshot().profiles.len(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    #[test]
+    fn packaged_helper_is_preferred_then_the_one_next_to_the_app() {
+        let c = super::helper_candidates(std::path::Path::new("/opt/veil"));
+        assert_eq!(c[0], std::path::PathBuf::from("/usr/lib/veil/veil-helper"));
+        assert_eq!(c[1], std::path::PathBuf::from("/opt/veil/veil-helper"));
+    }
+
+    #[test]
+    fn linux_has_tun_but_no_kill_switch() {
+        assert!(super::TUN_AVAILABLE);
+        assert!(!super::STANDBY_AVAILABLE);
     }
 }
