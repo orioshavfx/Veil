@@ -109,25 +109,53 @@ impl AppState {
     }
 
     /// Replaces all profiles of a subscription, keeping the selection and pins
-    /// of servers that survived (matched by server settings, then by name).
+    /// of servers that survived. Each old server is matched to at most one new one: by server
+    /// settings first, then by name when that name is unique on both sides. (Subscriptions
+    /// often hold many servers with the same name; matching by name alone pinned them all.)
     pub fn replace_subscription_profiles(&mut self, sub_id: Uuid, mut fresh: Vec<Profile>) {
-        let selected = self.selected_profile().filter(|p| p.subscription_id == Some(sub_id)).cloned();
+        let selected = self.selected_profile().filter(|p| p.subscription_id == Some(sub_id)).map(|p| p.id);
         let old: Vec<Profile> =
             self.profiles.iter().filter(|p| p.subscription_id == Some(sub_id)).cloned().collect();
-        let same = |a: &Profile, b: &Profile| a.server == b.server || a.name == b.name;
-        for p in &mut fresh {
-            p.pinned = old.iter().any(|o| o.pinned && same(o, p));
+        let matched = match_profiles(&old, &fresh);
+        for (o, m) in old.iter().zip(&matched) {
+            if let Some(j) = *m {
+                fresh[j].pinned = o.pinned;
+            }
         }
+        let new_selected = selected
+            .and_then(|id| old.iter().position(|o| o.id == id))
+            .and_then(|i| matched[i])
+            .map(|j| fresh[j].id);
         self.profiles.retain(|p| p.subscription_id != Some(sub_id));
-        if let Some(sel) = selected {
-            self.selected = fresh
-                .iter()
-                .find(|p| p.server == sel.server)
-                .or_else(|| fresh.iter().find(|p| p.name == sel.name))
-                .map(|p| p.id);
+        if selected.is_some() {
+            self.selected = new_selected;
         }
         self.profiles.extend(fresh);
     }
+}
+
+/// For every old profile the index of the new profile it stands for, if any; one-to-one.
+fn match_profiles(old: &[Profile], fresh: &[Profile]) -> Vec<Option<usize>> {
+    let mut result = vec![None; old.len()];
+    let mut taken = vec![false; fresh.len()];
+    for (i, o) in old.iter().enumerate() {
+        if let Some(j) = (0..fresh.len()).find(|&j| !taken[j] && fresh[j].server == o.server) {
+            result[i] = Some(j);
+            taken[j] = true;
+        }
+    }
+    for (i, o) in old.iter().enumerate() {
+        if result[i].is_some() {
+            continue;
+        }
+        let olds = old.iter().enumerate().filter(|(k, x)| result[*k].is_none() && x.name == o.name).count();
+        let news: Vec<usize> = (0..fresh.len()).filter(|&j| !taken[j] && fresh[j].name == o.name).collect();
+        if olds == 1 && news.len() == 1 {
+            result[i] = Some(news[0]);
+            taken[news[0]] = true;
+        }
+    }
+    result
 }
 
 pub struct Store {
@@ -332,5 +360,31 @@ mod tests {
         state.replace_subscription_profiles(sub, vec![mk("trojan://new@a.com:443#Germany"), mk("trojan://b@b.com:443#France")]);
         let pinned: Vec<_> = state.profiles.iter().filter(|p| p.pinned).map(|p| p.name.as_str()).collect();
         assert_eq!(pinned, ["Germany"]);
+    }
+
+    #[test]
+    fn subscription_refresh_does_not_pin_servers_that_share_a_name() {
+        let sub = Uuid::new_v4();
+        let mk = |link: &str| {
+            let mut p = parse_link(link).unwrap();
+            p.subscription_id = Some(sub);
+            p
+        };
+        let mut state = AppState::default();
+        let mut a = mk("trojan://a@a.com:443#Germany");
+        a.pinned = true;
+        state.profiles = vec![a, mk("trojan://b@b.com:443#Germany")];
+        // The subscription reshuffled: new addresses, three servers named Germany.
+        state.replace_subscription_profiles(
+            sub,
+            vec![
+                mk("trojan://c@c.com:443#Germany"),
+                mk("trojan://a@a.com:443#Germany"),
+                mk("trojan://d@d.com:443#Germany"),
+            ],
+        );
+        let pinned: Vec<_> = state.profiles.iter().filter(|p| p.pinned).collect();
+        assert_eq!(pinned.len(), 1);
+        assert!(format!("{:?}", pinned[0].server).contains("a.com"));
     }
 }
