@@ -2,8 +2,13 @@
 
 ## Unreleased
 
+Version 1.0.0-beta.3.
+
 ### Fixed
 
+- Subscriptions: a refresh no longer pins (or selects) every server that shares a name with a
+  pinned (selected) one; old servers are matched one-to-one, by server settings first, then by a
+  name that is unique on both sides.
 - Standby (macOS): after "Connect" from standby the app now drops its standby mark; before, the
   standby watch took the helper's "no standby" for a lost one and stopped the TUN a second later
   ("Standby ended: the TUN helper stopped").

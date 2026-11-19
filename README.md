@@ -14,7 +14,7 @@ A VPN / proxy client for macOS, written in Rust with a [Tauri 2](https://tauri.a
 Veil is **only a client**: it has no built-in servers, subscriptions or VPN service. You add your
 own servers (share links or subscription URLs) and set up routing rules yourself.
 
-> **Status: beta (1.0.0-beta.2).** macOS on Apple Silicon is the supported platform. The
+> **Status: beta (1.0.0-beta.3).** macOS on Apple Silicon is the supported platform. The
 > Windows build exists, but its TUN mode has not been verified on real machines. Expect rough
 > edges. Read [Security notes](#security-notes) before using it.
 
